@@ -1,0 +1,100 @@
+{
+  "api_url": {
+    "description": "Nowledge Mem 服务地址",
+    "type": "string",
+    "default": "http://127.0.0.1:14242",
+    "hint": "默认本机回环；非回环明文 HTTP 会打 WARNING"
+  },
+  "api_key": {
+    "description": "Nowledge Mem API Key",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "只保存在 AstrBot 配置中，请勿填入公开仓库"
+  },
+  "space_id": {
+    "description": "记忆空间 ID",
+    "type": "string",
+    "default": "space"
+  },
+  "agent_id": {
+    "description": "Context Bundle 使用的 Agent ID",
+    "type": "string",
+    "default": "astrbot"
+  },
+  "source_app": {
+    "description": "写入 Mem 时标记的来源应用",
+    "type": "string",
+    "default": "astrbot"
+  },
+  "enable_bundle": {
+    "description": "注入 Context Bundle",
+    "type": "bool",
+    "default": true
+  },
+  "bundle_every_turn": {
+    "description": "每轮注入 Context Bundle",
+    "type": "bool",
+    "default": true,
+    "hint": "默认 true；不依赖 compiled_hash，每轮都贴临时 part"
+  },
+  "bundle_on_change": {
+    "description": "仅在 Bundle 变化时注入（旧行为）",
+    "type": "bool",
+    "default": false,
+    "hint": "仅在 bundle_every_turn=false 时生效"
+  },
+  "enable_recall": {
+    "description": "每轮按当前消息召回记忆",
+    "type": "bool",
+    "default": true
+  },
+  "recall_limit": {
+    "description": "每轮最多注入的召回条数",
+    "type": "int",
+    "default": 5,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "timeout_seconds": {
+    "description": "读取接口超时（秒）",
+    "type": "int",
+    "default": 3,
+    "slider": {
+      "min": 1,
+      "max": 15,
+      "step": 1
+    }
+  },
+  "enable_capture": {
+    "description": "对话结束后同步增量消息到 Mem thread",
+    "type": "bool",
+    "default": true
+  },
+  "debug": {
+    "description": "输出调试日志",
+    "type": "bool",
+    "default": false
+  },
+  "capture_plugin_turns": {
+    "description": "是否捕获插件 source=plugin 的回合",
+    "type": "bool",
+    "default": false,
+    "hint": "默认 false；心跳等插件回合不进入对话记忆"
+  },
+  "capture_exclude_source_ids": {
+    "description": "永不捕获的 source_id 列表",
+    "type": "list",
+    "default": [],
+    "hint": "插件触发事件带 source_id；命中时整轮跳过捕获"
+  },
+  "heartbeat_markers": {
+    "description": "心跳等内部消息的前缀标记",
+    "type": "list",
+    "default": [],
+    "hint": "用户消息以其中任一前缀开头时视为内部消息，不写入 Mem"
+  }
+}

@@ -1,0 +1,2 @@
+# AstrBot 已自带 aiohttp；此处只声明插件直接使用的依赖。
+aiohttp
