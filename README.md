@@ -15,6 +15,7 @@
 | 增量回写 | 一轮结束后只把新增消息 append 到同一 thread |
 | append / reset | 前缀未变走 append；前缀变化或窗口缩水走整段 reset |
 | 失败重试 | 失败批次落到 pending，下一轮在后台按原 mode 重试 |
+| 三个工具 | nowledge_mem_search / nowledge_mem_save / nowledge_mem_status，模型可主动检索、保存、诊断 |
 
 ## 安装
 
@@ -75,6 +76,16 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 - `bundle_on_change=true`：仅在 `bundle_every_turn=false` 时启用旧的 hash 门控行为。
 - 注入文本带七条 guidance（313 字）：记忆是参考、主动保存、不存敏感信息、按需搜索、先说明再搜、Bundle 只是简报、不要引用包装；全文见 `core/inject.py` 的 `GUIDANCE`。
 - Bundle 失败回退链：GET `/context/bundle` → KV 缓存的最近一次 Bundle → 注入「记忆服务暂不可用，本轮无上下文」。不会静默空注入。
+
+### 工具
+
+| 工具 | 参数 | 说明 |
+| --- | --- | --- |
+| nowledge_mem_search | query、scope（memories/threads/both）、limit（1–20，默认 10）、mode（normal/deep） | 搜记忆或历史对话；空结果返回 no matches，请求失败返回 error:，两者不混淆 |
+| nowledge_mem_save | content、title、unit_type、importance（0–1）、labels | 写入记忆；标题截 200 字、标签截 64 字；save_admin_only=true 时仅管理员可用 |
+| nowledge_mem_status | 无 | 连接、space、agent、identity、pending、last_sync、服务端版本 |
+
+保存时把 source_umo 与 sender_hash（sha1 前 16 位，非匿名化）写入 metadata；服务端顶层不接受这三个字段，实测会被静默忽略。
 
 ### 游标与 append/reset
 
