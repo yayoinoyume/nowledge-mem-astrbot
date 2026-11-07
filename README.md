@@ -42,12 +42,13 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 | `space_id` | string | `space` | 记忆空间 ID |
 | `agent_id` | string | `astrbot` | Context Bundle 与工具使用的 Agent ID |
 | `source_app` | string | `astrbot` | 写入 Mem 时标记的来源应用 |
-| `save_admin_only` | bool | `false` | 仅管理员可调用 `nowledge_mem_save`；默认 member 也能写共享 space |
+| `save_admin_only` | bool | `false` | 仅管理员可调用 `nowledge_mem_save` 与 `nowledge_mem_update`；默认 member 也能写共享 space |
 | `enable_bundle` | bool | `true` | 是否注入 Context Bundle |
 | `bundle_every_turn` | bool | `true` | 每轮注入 Bundle |
 | `bundle_on_change` | bool | `false` | 缓存过期后是否重新拉取 Bundle 并刷新缓存；不控制是否注入 |
 | `enable_recall` | bool | `true` | 每轮按当前消息召回记忆 |
 | `recall_limit` | int | `5` | 每轮最多注入的召回条数（1–10） |
+| `mem_sum_rounds` | int | `10` | `/mem_sum` 取最近多少轮对话做蒸馏（3–30） |
 | `timeout_seconds` | int | `3` | 读取接口超时，秒（1–15） |
 | `fail_open` | bool | `true` | 读取失败时注入降级文本；`false` 时不降级，异常记入 AstrBot 错误日志（不承诺中止回合） |
 | `enable_capture` | bool | `true` | 对话结束后同步增量消息到 Mem thread |
@@ -76,7 +77,7 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 
 - `bundle_every_turn=true`（默认）：每轮都注入，用临时 part，不写入会话历史。同一会话 60 秒内复用 KV 里的上次 Bundle 以减少 GET；超过 60 秒重新拉取，`compiled_hash` 变化时立即刷新缓存。
 - `bundle_on_change=true`：只在 `bundle_every_turn=false` 时起作用——缓存超过 60 秒后重新 GET 并刷新缓存。两个开关都不控制是否注入，Bundle 始终每轮注入。
-- 注入文本带七条 guidance（313 字）：记忆是参考、主动保存、不存敏感信息、按需搜索、先说明再搜、Bundle 只是简报、不要引用包装；全文见 `core/inject.py` 的 `GUIDANCE`。
+- 注入文本带八条 guidance（387 字）：记忆是参考、主动保存、不存敏感信息、按需搜索、先说明再搜、Bundle 只是简报、不要引用包装；全文见 `core/inject.py` 的 `GUIDANCE`。
 - Bundle 失败回退链：GET `/context/bundle` → KV 缓存的最近一次 Bundle → 注入「记忆服务暂不可用，本轮无上下文」。不会静默空注入。
 
 ### 工具
@@ -85,6 +86,7 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 | --- | --- | --- |
 | nowledge_mem_search | query、scope（memories/threads/both）、limit（1–20，默认 10）、mode（normal/deep）、recorded_date_from/to | 搜记忆或历史对话；空结果返回 no matches，请求失败返回 error:，两者不混淆 |
 | nowledge_mem_save | content、title、unit_type、importance（0–1）、labels | 写入记忆；标题截 200 字、标签截 64 字；save_admin_only=true 时仅管理员可用 |
+| nowledge_mem_update | memory_id、content、title、unit_type、importance、labels | 改已有记忆，只提交给出的字段并回读校验；labels 服务端当前不生效，会返回一行 note；save_admin_only=true 时仅管理员可用 |
 | nowledge_mem_status | 无 | 连接、space、agent、identity、pending、last_sync、服务端版本；不输出 API Key |
 | nowledge_mem_get | memory_id | 读一条记忆全文、标题、类型、重要度、标签与 metadata；metadata 里的 file_path 递归剔除 |
 | nowledge_mem_thread_show | thread_id、offset（≥0，默认 0）、limit（1–100，默认 20） | 读历史对话消息；单条内容最多 500 字，丢弃 related_memories、entities、total_tokens |
@@ -93,7 +95,7 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 
 保存时把 source_umo 与 sender_hash（sha1 前 16 位，非匿名化）写入 metadata；服务端顶层不接受这三个字段，实测会被静默忽略。
 
-所有工具只返回字符串：成功是正文，失败以 `error:` 开头，不向对话抛异常。查询类工具 member 可用；`nowledge_mem_save` 仍受 `save_admin_only` 控制。
+所有工具只返回字符串：成功是正文，失败以 `error:` 开头，不向对话抛异常。查询类工具 member 可用；`nowledge_mem_save` 与 `nowledge_mem_update` 仍受 `save_admin_only` 控制。
 
 ### 斜杠命令
 
