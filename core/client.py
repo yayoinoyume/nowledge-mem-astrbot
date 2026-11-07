@@ -503,6 +503,47 @@ class NmemClient:
             raise NmemError("保存记忆响应不是对象")
         return data
 
+    async def update_memory(
+        self,
+        memory_id: str,
+        *,
+        content: str | None = None,
+        title: str | None = None,
+        unit_type: str | None = None,
+        importance: float | None = None,
+        labels: list[str] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """PATCH /memories/{id}：只发白名单字段。
+
+        服务端不校验 body：未知字段会 200 但被静默丢弃，所以白名单只能由客户端维护。
+        该端点没有任何 query 参数，也不需要 space_id。响应里的 labels 会变成
+        label_ids（存的是 id 不是名字），调用方不要拿返回值回写标签。
+        """
+        body: dict[str, Any] = {}
+        for key, value in (
+            ("content", content),
+            ("title", title),
+            ("unit_type", unit_type),
+            ("importance", importance),
+            ("labels", labels),
+        ):
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                # 空字符串视为“不改”，避免误清空服务端已有字段。
+                continue
+            body[key] = value
+        data = await self._request_strict(
+            "PATCH",
+            f"/memories/{quote(memory_id, safe='')}",
+            timeout=self._timeout if timeout is None else timeout,
+            json=body,
+        )
+        if not isinstance(data, dict):
+            raise NmemError("更新记忆响应不是对象")
+        return data
+
     async def health_details(self) -> dict[str, Any]:
         data = await self._request_strict(
             "GET", "/health/details", timeout=min(self._timeout, 3.0)

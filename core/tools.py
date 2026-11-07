@@ -32,6 +32,8 @@ SKILL_NAMES = (
     "distill-memory",
     "status",
     "save-thread",
+    "check-integration",
+    "explore-graph",
 )
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 VALID_SCOPES = ("memories", "threads", "both")
@@ -111,6 +113,19 @@ def _number(value: Any, default: float = 0.0) -> float:
     else:
         return default
     return number if math.isfinite(number) else default
+
+
+def _importance(value: Any) -> float | None:
+    """显式 importance 必须是 0-1 的有限数字；非法返回 None，不静默改默认值。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        return None
+    return score
 
 
 def _score(item: dict[str, Any], memory: dict[str, Any] | None = None) -> float:
@@ -242,6 +257,19 @@ def _labels(value: Any) -> list[str]:
     return labels
 
 
+def _update_unconfirmed(data: dict[str, Any], name: str, expected: Any) -> bool:
+    """PATCH 回读校验：服务端没回显或回显值不一致都算未确认。
+
+    只覆盖可按值核对的字段；labels 服务端只回 label_ids，由 update 单独处理。
+    """
+    if name == "importance":
+        return abs(_number(data.get("importance"), -1.0) - float(expected)) > 1e-6
+    returned = data.get(name)
+    if returned is None:
+        return True
+    return str(returned).strip() != str(expected).strip()
+
+
 def _dedupe(items: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
     merged: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
     for kind, item in items:
@@ -314,7 +342,7 @@ def _format_thread(index: int, item: dict[str, Any]) -> list[str]:
 
 
 class NmemTools:
-    """七个 llm_tool 的纯逻辑实现；所有失败都转成可读字符串。"""
+    """八个 llm_tool 的纯逻辑实现；所有失败都转成可读字符串。"""
 
     def __init__(
         self,
@@ -490,6 +518,85 @@ class NmemTools:
         except Exception as exc:
             self._logger.warning("nowledge_mem_save 失败：%s", type(exc).__name__)
             return f"error: 保存失败：{type(exc).__name__}: {exc}"
+
+    async def update(
+        self,
+        memory_id: str,
+        *,
+        content: str = "",
+        title: str = "",
+        unit_type: str = "",
+        importance: float | None = None,
+        labels: list[str] | None = None,
+        umo: str = "",
+        sender_id: str = "",
+        is_admin: bool = False,
+    ) -> str:
+        # umo / sender_id 只为与 save 保持签名一致：PATCH 端点没有溯源字段。
+        del umo, sender_id
+        try:
+            if self._save_admin_only and not is_admin:
+                return "error: 仅管理员可更新记忆"
+            target = str(memory_id or "").strip()
+            if not target:
+                return "error: memory_id 不能为空"
+            body: dict[str, Any] = {}
+            truncated = False
+            text = str(content or "").strip()
+            if text:
+                truncated = len(text) > MAX_SAVE_CHARS
+                body["content"] = text[:MAX_SAVE_CHARS]
+            heading = str(title or "").strip()
+            if heading:
+                truncated = truncated or len(heading) > MAX_TITLE_CHARS
+                body["title"] = heading[:MAX_TITLE_CHARS]
+            unit = str(unit_type or "").strip().lower()
+            if unit:
+                if unit not in VALID_UNIT_TYPES:
+                    return (
+                        "error: unit_type 必须是 fact、preference、decision、plan、"
+                        "procedure、learning、context 或 event"
+                    )
+                body["unit_type"] = unit
+            if importance is not None:
+                score = _importance(importance)
+                if score is None:
+                    return "error: importance 必须是 0 到 1 之间的数字"
+                body["importance"] = score
+            normalized_labels = _labels(labels)
+            if normalized_labels:
+                body["labels"] = normalized_labels
+            if not body:
+                return (
+                    "error: 至少提供 content、title、unit_type、importance 或 "
+                    "labels 之一"
+                )
+            data = await self._client.update_memory(
+                target,
+                content=body.get("content"),
+                title=body.get("title"),
+                unit_type=body.get("unit_type"),
+                importance=body.get("importance"),
+                labels=body.get("labels"),
+            )
+            resolved_id = str(data.get("id") or target).strip()
+            lines = [f"updated: id={resolved_id} fields={','.join(body)}"]
+            for name, expected in body.items():
+                if name == "labels":
+                    continue
+                if _update_unconfirmed(data, name, expected):
+                    lines.append(f"warn: 服务端未确认字段 {name}")
+            if "labels" in body:
+                # 服务端只回 label_ids 且当前忽略 labels；提示一次，不算未确认。
+                lines.append("note: 服务端当前忽略 labels 字段，本次标签变更未生效")
+            if truncated:
+                lines.append("note: 内容或标题超长已截断")
+            return "\n".join(lines)
+        except NmemError as exc:
+            return f"error: Nowledge Mem 更新失败：{exc}"
+        except Exception as exc:
+            self._logger.warning("nowledge_mem_update 失败：%s", type(exc).__name__)
+            return f"error: 更新失败：{type(exc).__name__}: {exc}"
 
     async def get_memory(self, memory_id: str) -> str:
         try:

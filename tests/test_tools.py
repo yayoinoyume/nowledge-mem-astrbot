@@ -1,4 +1,4 @@
-"""七个 llm_tool 的参数校验、两种搜索形态、上下界、写权限、状态与失败路径。"""
+"""八个 llm_tool 的参数校验、两种搜索形态、上下界、写权限、状态与失败路径。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from core.tools import (
     MAX_PREVIEW_CHARS,
     MAX_SAVE_CHARS,
     MAX_TITLE_CHARS,
+    SKILL_NAMES,
     NmemTools,
 )
 from tests.helpers import FakeStore
@@ -25,10 +26,12 @@ class FakeToolClient:
         threads=None,
         threads_response=None,
         save_result=None,
+        update_result=None,
         health_result=None,
         health_details_result=None,
         search_error=None,
         save_error=None,
+        update_error=None,
         health_error=None,
         health_details_error=None,
         attention_result=None,
@@ -49,6 +52,7 @@ class FakeToolClient:
         self.threads = threads or []
         self.threads_response = threads_response
         self.save_result = save_result or {"id": "m-new", "title": "新记忆"}
+        self.update_result = update_result
         self.health_result = health_result or {"status": "ok"}
         self.health_details_result = health_details_result or {
             "status": "ok",
@@ -57,6 +61,7 @@ class FakeToolClient:
         }
         self.search_error = search_error
         self.save_error = save_error
+        self.update_error = update_error
         self.health_error = health_error
         self.health_details_error = health_details_error
         self.attention_result = attention_result
@@ -97,6 +102,7 @@ class FakeToolClient:
         self.show_thread_calls: list[dict] = []
         self.graph_calls: list[dict] = []
         self.save_calls: list[dict] = []
+        self.update_calls: list[dict] = []
         self.health_calls = 0
         self.health_details_calls = 0
         self.attention_calls = 0
@@ -146,6 +152,15 @@ class FakeToolClient:
             raise self.save_error
         return dict(self.save_result)
 
+    async def update_memory(self, memory_id, **kwargs):
+        self.update_calls.append({"memory_id": memory_id, **kwargs})
+        if self.update_error:
+            raise self.update_error
+        if self.update_result is not None:
+            return dict(self.update_result)
+        # 默认把请求字段原样回显，模拟服务端确认写入。
+        return {"id": memory_id, **{k: v for k, v in kwargs.items() if v is not None}}
+
     async def health_details(self):
         self.health_details_calls += 1
         if self.health_details_error:
@@ -185,7 +200,7 @@ def _tools(
         agent_id="astrbot",
         source_app="astrbot",
         identity="identity123",
-        plugin_version="0.17.0",
+        plugin_version="0.18.0",
         save_admin_only=save_admin_only,
         timeout_seconds=timeout_seconds,
     )
@@ -399,6 +414,164 @@ def test_save_timeout_is_reported() -> None:
     assert result.startswith("error: Nowledge Mem 保存失败：请求失败：TimeoutError")
 
 
+def test_update_sends_only_provided_fields() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(
+        _tools(client).update("m1", content="新正文", title="新标题")
+    )
+    assert result == "updated: id=m1 fields=content,title"
+    call = client.update_calls[0]
+    assert call["memory_id"] == "m1"
+    assert call["content"] == "新正文"
+    assert call["title"] == "新标题"
+    assert call["unit_type"] is None
+    assert call["importance"] is None
+    assert call["labels"] is None
+
+
+def test_update_requires_memory_id() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).update("  ", content="新正文"))
+    assert result == "error: memory_id 不能为空"
+    assert client.update_calls == []
+
+
+def test_update_requires_at_least_one_field() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).update("m1", content="  ", title=""))
+    assert result == (
+        "error: 至少提供 content、title、unit_type、importance 或 labels 之一"
+    )
+    assert client.update_calls == []
+
+
+def test_update_rejects_invalid_unit_type() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).update("m1", unit_type="unknown"))
+    assert result.startswith("error: unit_type 必须是")
+    assert client.update_calls == []
+
+
+def test_update_truncates_content_and_title() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(
+        _tools(client).update(
+            "m1",
+            content="x" * (MAX_SAVE_CHARS + 10),
+            title="y" * (MAX_TITLE_CHARS + 10),
+        )
+    )
+    call = client.update_calls[0]
+    assert len(call["content"]) == MAX_SAVE_CHARS
+    assert len(call["title"]) == MAX_TITLE_CHARS
+    assert result.count("note: 内容或标题超长已截断") == 1
+
+
+def test_update_accepts_numeric_string_importance() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).update("m1", importance="0.9"))
+    assert client.update_calls[0]["importance"] == 0.9
+    assert "warn" not in result
+
+
+def test_update_rejects_non_finite_importance() -> None:
+    for value in ("abc", float("nan"), float("inf")):
+        client = FakeToolClient()
+        result = asyncio.run(_tools(client).update("m1", importance=value))
+        assert result == "error: importance 必须是 0 到 1 之间的数字"
+        assert client.update_calls == []
+
+
+def test_update_rejects_out_of_range_importance() -> None:
+    for value in (1.8, -0.2):
+        client = FakeToolClient()
+        result = asyncio.run(_tools(client).update("m1", importance=value))
+        assert result == "error: importance 必须是 0 到 1 之间的数字"
+        assert client.update_calls == []
+
+
+def test_update_normalizes_unit_type_case() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).update("m1", unit_type=" Decision "))
+    assert client.update_calls[0]["unit_type"] == "decision"
+    assert "warn" not in result
+
+
+def test_update_normalizes_labels() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(
+        _tools(client).update("m1", labels=[" alpha ", "alpha", "beta"])
+    )
+    assert client.update_calls[0]["labels"] == ["alpha", "beta"]
+    assert result == (
+        "updated: id=m1 fields=labels\n"
+        "note: 服务端当前忽略 labels 字段，本次标签变更未生效"
+    )
+
+
+def test_update_admin_only_rejects_member() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(
+        _tools(client, save_admin_only=True).update(
+            "m1", content="新正文", is_admin=False
+        )
+    )
+    assert result == "error: 仅管理员可更新记忆"
+    assert client.update_calls == []
+
+
+def test_update_admin_only_allows_admin() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(
+        _tools(client, save_admin_only=True).update(
+            "m1", content="新正文", is_admin=True
+        )
+    )
+    assert result.startswith("updated: id=m1")
+    assert len(client.update_calls) == 1
+
+
+def test_update_notes_labels_cannot_be_verified() -> None:
+    client = FakeToolClient(
+        update_result={"id": "m1", "content": "新正文", "label_ids": ["l1"]}
+    )
+    result = asyncio.run(
+        _tools(client).update("m1", content="新正文", labels=["alpha"])
+    )
+    lines = result.splitlines()
+    assert lines[0] == "updated: id=m1 fields=content,labels"
+    assert lines[-1] == "note: 服务端当前忽略 labels 字段，本次标签变更未生效"
+    assert "warn" not in result
+
+
+def test_update_warns_when_unit_type_not_applied() -> None:
+    client = FakeToolClient(update_result={"id": "m1", "unit_type": "fact"})
+    result = asyncio.run(_tools(client).update("m1", unit_type="decision"))
+    assert "warn: 服务端未确认字段 unit_type" in result
+
+
+def test_update_importance_readback_tolerance() -> None:
+    confirmed = FakeToolClient(update_result={"id": "m1", "importance": 0.8})
+    assert "warn" not in asyncio.run(
+        _tools(confirmed).update("m1", importance=0.8)
+    )
+    changed = FakeToolClient(update_result={"id": "m1", "importance": 0.5})
+    result = asyncio.run(_tools(changed).update("m1", importance=0.8))
+    assert "warn: 服务端未确认字段 importance" in result
+
+
+def test_update_http_error_is_reported() -> None:
+    client = FakeToolClient(update_error=NmemError("HTTP 404", status=404))
+    result = asyncio.run(_tools(client).update("m1", content="新正文"))
+    assert result.startswith("error: Nowledge Mem 更新失败：HTTP 404")
+
+
+def test_update_timeout_is_reported() -> None:
+    client = FakeToolClient(update_error=NmemError("请求失败：TimeoutError"))
+    result = asyncio.run(_tools(client).update("m1", content="新正文"))
+    assert result.startswith("error: Nowledge Mem 更新失败：请求失败：TimeoutError")
+
+
 def test_status_reports_versions_attention_pending_and_last_sync() -> None:
     store = FakeStore()
     store.data[("pending", "test", "umo")] = {"attempts": 1}
@@ -423,7 +596,7 @@ def test_status_reports_versions_attention_pending_and_last_sync() -> None:
     assert "attention_has_pending_reviews: true (非精确计数)" in result
     assert "pending: 1 (本会话)" in result
     assert "last_sync: 2026-11-07T10:00:00+00:00" in result
-    assert "plugin_version: 0.17.0" in result
+    assert "plugin_version: 0.18.0" in result
     assert client.attention_calls == 0
 
 
@@ -845,9 +1018,15 @@ def test_graph_timeout_is_reported() -> None:
     assert result.startswith("error: Nowledge Mem 图探索失败：请求失败：TimeoutError")
 
 
-def test_skill_reads_existing_body_without_frontmatter() -> None:
+def test_skill_reads_every_declared_skill_body() -> None:
+    assert len(SKILL_NAMES) == 7
+    for name in SKILL_NAMES:
+        result = asyncio.run(_tools().skill(name))
+        header = f"skill: {name}\n\n"
+        assert result.startswith(header), name
+        assert result[len(header):].strip(), name
+        assert not result.startswith("---"), name
     result = asyncio.run(_tools().skill("search-memory"))
-    assert result.startswith("skill: search-memory")
     assert "## 什么时候搜" in result
     assert not result.startswith("---")
 

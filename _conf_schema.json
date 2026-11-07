@@ -65,6 +65,17 @@
       "step": 1
     }
   },
+  "mem_sum_rounds": {
+    "description": "/mem_sum 蒸馏时扫描的最近轮数",
+    "type": "int",
+    "default": 10,
+    "slider": {
+      "min": 3,
+      "max": 30,
+      "step": 1
+    },
+    "hint": "只影响 /mem_sum；轮数越多越可能超出模型上下文"
+  },
   "timeout_seconds": {
     "description": "读取接口超时（秒）",
     "type": "int",

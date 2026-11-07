@@ -1,4 +1,4 @@
-"""插件级注册与权限：7 个 llm_tool、4 个斜杠命令、save_admin_only 与空参数。
+"""插件级注册与权限：8 个 llm_tool、4 个斜杠命令、save_admin_only 与空参数。
 
 需要 ASTRBOT_SOURCE 指向 AstrBot 源码根（其下有 astrbot/ 包）；不可用时整模块跳过。
 """
@@ -10,6 +10,7 @@ import atexit
 import hashlib
 import importlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -52,6 +53,7 @@ except ImportError as exc:
 EXPECTED_TOOLS = {
     "nowledge_mem_search",
     "nowledge_mem_save",
+    "nowledge_mem_update",
     "nowledge_mem_status",
     "nowledge_mem_get",
     "nowledge_mem_thread_show",
@@ -91,6 +93,7 @@ class _FakeClient:
 
     def __init__(self) -> None:
         self.save_calls: list[dict] = []
+        self.update_calls: list[dict] = []
         self.search_calls: list[dict] = []
 
     async def search(self, query: str, **kwargs) -> list[dict]:
@@ -103,6 +106,10 @@ class _FakeClient:
     async def save_memory(self, content: str, **kwargs) -> dict:
         self.save_calls.append({"content": content, **kwargs})
         return {"id": "m-new", "title": "标题"}
+
+    async def update_memory(self, memory_id: str, **kwargs) -> dict:
+        self.update_calls.append({"memory_id": memory_id, **kwargs})
+        return {"id": memory_id, **{k: v for k, v in kwargs.items() if v is not None}}
 
     async def get_memory(self, memory_id: str, **kwargs) -> dict:
         return {
@@ -146,7 +153,7 @@ def _plugin(*, save_admin_only: bool = False):
             agent_id="astrbot",
             source_app="astrbot",
             identity="identity123",
-            plugin_version="0.17.0",
+            plugin_version="0.18.0",
             save_admin_only=save_admin_only,
             timeout_seconds=3,
         )
@@ -210,6 +217,16 @@ def test_tool_parameter_schema() -> None:
         "labels": "array",
     }
     assert save["labels"]["items"] == {"type": "string"}
+    update = tools["nowledge_mem_update"].parameters["properties"]
+    assert {name: update[name]["type"] for name in update} == {
+        "memory_id": "string",
+        "content": "string",
+        "title": "string",
+        "unit_type": "string",
+        "importance": "number",
+        "labels": "array",
+    }
+    assert update["labels"]["items"] == {"type": "string"}
     assert tools["nowledge_mem_status"].parameters["properties"] == {}
     assert {
         name: tools["nowledge_mem_get"].parameters["properties"][name]["type"]
@@ -274,6 +291,48 @@ def test_save_admin_only_allows_admin_through_wrapper() -> None:
     call = client.save_calls[0]
     assert call["source_umo"] == "qq:group:1"
     assert call["sender_hash"] == hashlib.sha1(b"123").hexdigest()[:16]
+
+
+def test_update_tool_description_mentions_search_first() -> None:
+    description = _registered()["nowledge_mem_update"].description
+    assert "search" in description
+
+
+def test_update_wrapper_without_memory_id_returns_error() -> None:
+    stub, client = _plugin()
+    result = asyncio.run(
+        plugin_main.NowledgeMemPlugin.nowledge_mem_update(
+            stub, _Event(admin=True), content="新正文"
+        )
+    )
+    assert result == "error: memory_id 不能为空"
+    assert client.update_calls == []
+
+
+def test_update_admin_only_blocks_member_through_wrapper() -> None:
+    stub, client = _plugin(save_admin_only=True)
+    result = asyncio.run(
+        plugin_main.NowledgeMemPlugin.nowledge_mem_update(
+            stub, _Event(admin=False), "m1", content="新正文"
+        )
+    )
+    assert result == "error: 仅管理员可更新记忆"
+    assert client.update_calls == []
+
+
+def test_update_wrapper_allows_admin_and_passes_fields() -> None:
+    stub, client = _plugin(save_admin_only=True)
+    result = asyncio.run(
+        plugin_main.NowledgeMemPlugin.nowledge_mem_update(
+            stub, _Event(admin=True), "m1", content="新正文", unit_type="decision"
+        )
+    )
+    assert result.startswith("updated: id=m1")
+    call = client.update_calls[0]
+    assert call["memory_id"] == "m1"
+    assert call["content"] == "新正文"
+    assert call["unit_type"] == "decision"
+    assert call["title"] is None
 
 
 def _collect(agen):
@@ -458,38 +517,276 @@ def test_mem_status_command_outputs_status() -> None:
     assert tools.status_calls == ["qq:group:1"]
 
 
+class _FakeProvider:
+    def __init__(self, text: str = "", error: BaseException | None = None) -> None:
+        self.text = text
+        self.error = error
+        self.calls: list[dict] = []
+
+    async def text_chat(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(completion_text=self.text)
+
+
+class _FakeContext:
+    def __init__(self, provider) -> None:
+        self._provider = provider
+        self.umos: list[str | None] = []
+
+    async def get_using_provider_async(self, umo=None):
+        self.umos.append(umo)
+        return self._provider
+
+
+class _SyncOnlyContext:
+    """模拟 4.24.2-4.27.2：只有同步 get_using_provider，且不接受 umo。"""
+
+    def __init__(self, provider) -> None:
+        self._provider = provider
+        self.calls = 0
+
+    def get_using_provider(self):
+        self.calls += 1
+        return self._provider
+
+
+def _mem_sum_stub(
+    tools,
+    provider,
+    *,
+    material: str = "会话总结（最近 2 轮）\nuser: 我们用 PATCH 更新记忆",
+    count: int = 4,
+    rounds: int = 2,
+    round_config: int = 10,
+    context=None,
+):
+    async def fake_history(umo, max_rounds):
+        assert umo == "qq:group:1"
+        assert max_rounds == round_config
+        return material, count, rounds, "会话总结"
+
+    stub = SimpleNamespace(
+        _tools=tools,
+        _mem_sum_rounds=round_config,
+        context=context if context is not None else _FakeContext(provider),
+        logger=logging.getLogger("test"),
+    )
+    stub._recent_history_text = fake_history
+    return stub
+
+
+DISTILLED = [
+    {
+        "content": "更新记忆用 PATCH /memories/{id}",
+        "title": "更新记忆用 PATCH",
+        "unit_type": "decision",
+        "importance": 0.9,
+        "labels": ["mem"],
+    },
+    {
+        "content": "服务端不校验 PATCH body",
+        "title": "PATCH body 不校验",
+        "unit_type": "learning",
+        "importance": 0.7,
+        "labels": ["mem"],
+    },
+]
+
+
 def test_mem_sum_command_member_denied() -> None:
     tools = _CommandTools()
-    stub = SimpleNamespace(_tools=tools)
+    provider = _FakeProvider("[]")
+    stub = _mem_sum_stub(tools, provider)
     outputs = _collect(
         plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=False))
     )
     assert outputs == ["error: 仅管理员可使用 /mem_sum"]
     assert tools.save_calls == []
+    assert provider.calls == []
 
 
-def test_mem_sum_command_admin_saves_context() -> None:
+def test_mem_sum_command_without_history() -> None:
     tools = _CommandTools()
-    stub = SimpleNamespace(_tools=tools)
-
-    async def fake_history(umo, rounds):
-        assert umo == "qq:group:1"
-        assert rounds == 5
-        return "会话总结正文", 4, 2, "会话总结 - 标题"
-
-    stub._recent_history_text = fake_history
+    provider = _FakeProvider("[]")
+    stub = _mem_sum_stub(tools, provider, material="")
     outputs = _collect(
         plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
     )
-    assert outputs[0].startswith("saved:")
-    assert "已汇总最近 2 轮（4 条消息）" in outputs[0]
-    call = tools.save_calls[0]
-    assert call["content"] == "会话总结正文"
-    assert call["title"] == "会话总结 - 标题"
-    assert call["unit_type"] == "context"
-    assert call["importance"] == 0.5
-    assert call["labels"] == ["会话总结"]
-    assert call["is_admin"] is True
+    assert outputs == ["error: 当前会话没有可总结的对话"]
+    assert tools.save_calls == []
+    assert provider.calls == []
+
+
+def test_mem_sum_command_without_provider() -> None:
+    tools = _CommandTools()
+    stub = _mem_sum_stub(tools, None)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs == [
+        "error: 当前没有可用的模型，无法蒸馏（可改用 /mem_search 手动检索已有记忆）"
+    ]
+    assert tools.save_calls == []
+
+
+def test_mem_sum_falls_back_to_sync_provider() -> None:
+    tools = _CommandTools()
+    provider = _FakeProvider(json.dumps(DISTILLED[:1], ensure_ascii=False))
+    context = _SyncOnlyContext(provider)
+    stub = _mem_sum_stub(tools, provider, context=context)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs[0].startswith("distilled: 保存 1/1 条记忆")
+    assert context.calls == 1
+    assert len(provider.calls) == 1
+
+
+def test_using_provider_awaits_coroutine_from_legacy_async_getter() -> None:
+    class _CoroContext:
+        async def get_using_provider(self) -> str:
+            return "coro-provider"
+
+    provider = asyncio.run(
+        plugin_main._using_provider(_CoroContext(), "umo")  # type: ignore[arg-type]
+    )
+    assert provider == "coro-provider"
+
+
+def test_using_provider_returns_none_without_getter() -> None:
+    class _EmptyContext:
+        pass
+
+    assert asyncio.run(
+        plugin_main._using_provider(_EmptyContext(), "umo")  # type: ignore[arg-type]
+    ) is None
+
+
+def test_mem_sum_command_saves_distilled_items() -> None:
+    tools = _CommandTools()
+    provider = _FakeProvider(json.dumps(DISTILLED, ensure_ascii=False))
+    stub = _mem_sum_stub(tools, provider)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs == [
+        "distilled: 保存 2/2 条记忆\n"
+        "- [decision] 更新记忆用 PATCH (0.90)\n"
+        "- [learning] PATCH body 不校验 (0.70)\n"
+        "note: 已扫描最近 2 轮（4 条消息）"
+    ]
+    call = provider.calls[0]
+    assert call["prompt"].startswith("会话总结（最近 2 轮）")
+    assert "system_prompt" in call
+    saves = tools.save_calls
+    assert [item["unit_type"] for item in saves] == ["decision", "learning"]
+    assert [item["importance"] for item in saves] == [0.9, 0.7]
+    assert saves[0]["labels"] == ["mem"]
+    assert saves[0]["umo"] == "qq:group:1"
+    assert saves[0]["sender_id"] == "123"
+    assert saves[0]["is_admin"] is True
+    assert stub.context.umos == ["qq:group:1"]
+
+
+def test_mem_sum_command_strips_json_fence() -> None:
+    tools = _CommandTools()
+    fenced = "\x60\x60\x60json\n" + json.dumps(
+        DISTILLED[:1], ensure_ascii=False
+    ) + "\n\x60\x60\x60"
+    stub = _mem_sum_stub(tools, _FakeProvider(fenced))
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs[0].startswith("distilled: 保存 1/1 条记忆")
+
+
+def test_mem_sum_command_invalid_json() -> None:
+    tools = _CommandTools()
+    provider = _FakeProvider("这不是 JSON")
+    stub = _mem_sum_stub(tools, provider)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs == ["error: 提炼结果不是合法 JSON"]
+    assert tools.save_calls == []
+
+
+def test_mem_sum_command_empty_array() -> None:
+    tools = _CommandTools()
+    provider = _FakeProvider("[]")
+    stub = _mem_sum_stub(tools, provider)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs == ["no_insight: 最近 2 轮没有值得沉淀的内容"]
+    assert tools.save_calls == []
+
+
+def test_mem_sum_command_drops_invalid_items() -> None:
+    tools = _CommandTools()
+    provider = _FakeProvider(
+        json.dumps(
+            [
+                DISTILLED[0],
+                {"content": "类型非法", "unit_type": "bogus", "importance": 0.5},
+                {"content": "重要度越界", "unit_type": "fact", "importance": 1.7},
+                {"content": "", "unit_type": "fact", "importance": 0.5},
+            ],
+            ensure_ascii=False,
+        )
+    )
+    stub = _mem_sum_stub(tools, provider)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs[0].startswith("distilled: 保存 1/1 条记忆")
+    assert "note: 丢弃 3 条（非法或超出上限）" in outputs[0]
+    assert len(tools.save_calls) == 1
+
+
+def test_mem_sum_command_reports_items_dropped_by_limit() -> None:
+    entries = [
+        {
+            "content": f"第 {index} 条",
+            "title": f"第 {index} 条",
+            "unit_type": "fact",
+            "importance": 0.5,
+        }
+        for index in range(10)
+    ]
+    tools = _CommandTools()
+    provider = _FakeProvider(json.dumps(entries, ensure_ascii=False))
+    stub = _mem_sum_stub(tools, provider)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs[0].startswith("distilled: 保存 8/8 条记忆")
+    assert "note: 丢弃 2 条（非法或超出上限）" in outputs[0]
+    assert len(tools.save_calls) == 8
+
+
+def test_mem_sum_command_provider_error() -> None:
+    tools = _CommandTools()
+    provider = _FakeProvider(error=RuntimeError("上游 500"))
+    stub = _mem_sum_stub(tools, provider)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs == ["error: 蒸馏失败：RuntimeError"]
+    assert tools.save_calls == []
+
+
+def test_mem_sum_command_marks_failed_saves() -> None:
+    tools = _CommandTools(save_result="error: Nowledge Mem 保存失败：HTTP 500")
+    provider = _FakeProvider(json.dumps(DISTILLED[:1], ensure_ascii=False))
+    stub = _mem_sum_stub(tools, provider)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs[0].startswith("distilled: 保存 0/1 条记忆")
+    assert "(保存失败)" in outputs[0]
 
 
 class _HistoryManager:
@@ -514,14 +811,20 @@ def _history_messages(count: int) -> list[dict]:
 
 
 @pytest.mark.parametrize(
-    ("message_count", "rounds"), [(0, 0), (3, 2), (10, 5)]
+    ("message_count", "expected_rounds"), [(0, 0), (3, 2), (10, 3)]
 )
-def test_mem_sum_uses_actual_rounds(message_count: int, rounds: int) -> None:
+def test_mem_sum_scans_configured_rounds(
+    message_count: int, expected_rounds: int
+) -> None:
     tools = _CommandTools()
-    manager = _HistoryManager(_history_messages(message_count))
+    provider = _FakeProvider("[]")
+    context = _FakeContext(provider)
+    context.conversation_manager = _HistoryManager(_history_messages(message_count))
     stub = SimpleNamespace(
         _tools=tools,
-        context=SimpleNamespace(conversation_manager=manager),
+        _mem_sum_rounds=3,
+        context=context,
+        logger=logging.getLogger("test"),
     )
     stub._recent_history_text = (
         lambda umo, max_rounds: plugin_main.NowledgeMemPlugin._recent_history_text(
@@ -534,25 +837,38 @@ def test_mem_sum_uses_actual_rounds(message_count: int, rounds: int) -> None:
     )
     if message_count == 0:
         assert outputs == ["error: 当前会话没有可总结的对话"]
-        assert tools.save_calls == []
+        assert provider.calls == []
         return
-    assert outputs[0].startswith("saved:")
-    assert f"已汇总最近 {rounds} 轮（{message_count} 条消息）" in outputs[0]
-    saved = tools.save_calls[0]["content"]
-    assert saved.startswith(f"会话总结（最近 {rounds} 轮）")
-    assert saved.count("message-") == message_count
+    assert outputs == [f"no_insight: 最近 {expected_rounds} 轮没有值得沉淀的内容"]
+    prompt = provider.calls[0]["prompt"]
+    assert prompt.startswith(f"会话总结（最近 {expected_rounds} 轮）")
+    assert prompt.count("message-") == min(message_count, expected_rounds * 2)
 
 
-def test_mem_sum_command_without_history() -> None:
-    tools = _CommandTools()
-    stub = SimpleNamespace(_tools=tools)
+def test_recent_history_keeps_newest_messages_when_over_budget() -> None:
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"message-{index} " + "x" * 500,
+        }
+        for index in range(20)
+    ]
+    context = SimpleNamespace(conversation_manager=_HistoryManager(history))
+    stub = SimpleNamespace(context=context)
 
-    async def empty_history(umo, rounds):
-        return "", 0, 0, ""
-
-    stub._recent_history_text = empty_history
-    outputs = _collect(
-        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    text, count, rounds, _title = asyncio.run(
+        plugin_main.NowledgeMemPlugin._recent_history_text(stub, "qq:group:1", 10)
     )
-    assert outputs == ["error: 当前会话没有可总结的对话"]
-    assert tools.save_calls == []
+
+    assert "message-19" in text
+    assert "message-0" not in text
+    assert len(text) <= plugin_main.MAX_SUMMARY_CHARS
+    assert count < 20
+    # 顺序必须是从旧到新：第一条的序号小于最后一条
+    lines = [ln for ln in text.splitlines() if ln.startswith(("user:", "assistant:"))]
+    first = int(lines[0].split("message-", 1)[1].split()[0])
+    last = int(lines[-1].split("message-", 1)[1].split()[0])
+    assert first < last
+    assert len(text.splitlines()) - 1 == count
+    assert rounds == (count + 1) // 2
+    assert text.splitlines()[0] == f"会话总结（最近 {rounds} 轮）"

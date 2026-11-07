@@ -344,6 +344,40 @@ def test_save_memory_posts_provenance_fields() -> None:
     }
 
 
+def test_update_memory_patches_only_given_fields() -> None:
+    session = FakeSession(
+        [FakeResponse(200, {"id": "m1", "content": "新正文", "label_ids": ["l1"]})]
+    )
+    client = _client(session)
+    result = asyncio.run(
+        client.update_memory("m1", content="新正文", title="", labels=["alpha"])
+    )
+    assert result["id"] == "m1"
+    call = session.calls[0]
+    assert call["method"] == "PATCH"
+    assert call["url"] == "http://127.0.0.1:14242/memories/m1"
+    assert call["kwargs"]["json"] == {"content": "新正文", "labels": ["alpha"]}
+    assert "params" not in call["kwargs"]
+
+
+def test_update_memory_quotes_id_and_reports_404() -> None:
+    session = FakeSession([FakeResponse(404, {"detail": "Memory not found"})])
+    client = _client(session)
+    with pytest.raises(NmemError) as excinfo:
+        asyncio.run(client.update_memory("a/b", importance=0.5))
+    assert excinfo.value.status == 404
+    call = session.calls[0]
+    assert call["url"] == "http://127.0.0.1:14242/memories/a%2Fb"
+    assert call["kwargs"]["json"] == {"importance": 0.5}
+
+
+def test_update_memory_non_object_raises() -> None:
+    session = FakeSession([FakeResponse(200, [])])
+    client = _client(session)
+    with pytest.raises(NmemError):
+        asyncio.run(client.update_memory("m1", content="新正文"))
+
+
 def test_get_memory_uses_get_and_space_guard() -> None:
     session = FakeSession([FakeResponse(200, {"id": "m1", "content": "正文"})])
     client = _client(session)

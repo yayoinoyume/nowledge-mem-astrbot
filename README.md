@@ -3,8 +3,8 @@
 把 [Nowledge Mem](https://mem.nowledge.co) 的上下文与长期记忆接入 AstrBot：每轮对话前注入 Context Bundle 与相关记忆召回，每轮结束后把新增消息增量写回同一个 Mem thread。
 
 - 插件名：`nowledge_mem_astrbot`
-- 版本：0.17.0
-- 要求：AstrBot >= 4.24.2
+- 版本：0.18.0
+- 要求：AstrBot >= 4.27.3
 
 ## 能力
 
@@ -15,7 +15,7 @@
 | 增量回写 | 一轮结束后只把新增消息 append 到同一 thread |
 | append / reset | 前缀未变走 append；前缀变化或窗口缩水走整段 reset |
 | 失败重试 | 失败批次落到 pending，下一轮在后台按原 mode 重试 |
-| 七个工具 | nowledge_mem_search / save / status / get / thread_show / graph / skill，模型可主动检索、保存、诊断与读技能 |
+| 八个工具 | nowledge_mem_search / save / update / status / get / thread_show / graph / skill，模型可主动检索、保存、更新、诊断与读技能 |
 
 ## 安装
 
@@ -89,7 +89,7 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 | nowledge_mem_get | memory_id | 读一条记忆全文、标题、类型、重要度、标签与 metadata；metadata 里的 file_path 递归剔除 |
 | nowledge_mem_thread_show | thread_id、offset（≥0，默认 0）、limit（1–100，默认 20） | 读历史对话消息；单条内容最多 500 字，丢弃 related_memories、entities、total_tokens |
 | nowledge_mem_graph | query 或 memory_id（二选一）、depth（1–5，默认 1） | 探索知识图谱，返回相邻实体、关系和方向；未知节点返回「无邻居或节点不存在」 |
-| nowledge_mem_skill | name | 读取内置技能正文；只允许 5 个固定名字，拒绝路径穿越 |
+| nowledge_mem_skill | name | 读取内置技能正文；只允许 7 个固定名字，拒绝路径穿越 |
 
 保存时把 source_umo 与 sender_hash（sha1 前 16 位，非匿名化）写入 metadata；服务端顶层不接受这三个字段，实测会被静默忽略。
 
@@ -102,17 +102,19 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 - `/mem_search <query>`：固定 `scope=memories`、`limit=5`；空结果 `no matches`，失败 `error:`。
 - `/mem_save [fact|context] <text>`：默认 `fact`；`context ` 前缀改为 `context` 并去掉前缀；权限走 `save_admin_only`。
 - `/mem_status`：等价 `nowledge_mem_status`。
-- `/mem_sum`：仅管理员；把当前会话最近最多 5 轮 user/assistant 拼成一条 `context` 记忆（`labels=[会话总结]`、`importance=0.5`），不额外调用模型；轮数按实际消息数反算。
+- `/mem_sum`：仅管理员；用当前模型把最近若干轮（默认 10 轮，可配 `mem_sum_rounds` 3-30）蒸馏成多条原子记忆后逐条写入，条数上限 8；报告里给真实覆盖轮数与丢弃计数。
 
 ### 技能包
 
-插件目录 `skills/` 下放 5 个 `SKILL.md`，内容与注入的 guidance 对齐：
+插件目录 `skills/` 下放 7 个 `SKILL.md`，内容与注入的 guidance 对齐：
 
 - `read-working-memory`：会话开始时读 Working Memory；已注入 Bundle 时不要重复读。
 - `search-memory`：检索路由、recorded 时间窗、有界 thread 读取与图谱探索。
 - `distill-memory`：保存时机、类型、重要度、去重与安全红线。
 - `status`：状态解读与排障。
-- `save-thread`：自动 thread 同步、`/mem_sum` 与结构化交接。
+- `save-thread`：自动 thread 同步与结构化交接（目标/决定/改动面/风险/下一步）。
+- `check-integration`：记忆功能自检手册（连接、鉴权、检索链路、空间配置与常见故障）。
+- `explore-graph`：用 `nowledge_mem_graph` 展开记忆邻居与关系，渐进加深，不承诺可视化网页。
 
 模型可调用 `nowledge_mem_skill(name)` 按需读取正文。
 
