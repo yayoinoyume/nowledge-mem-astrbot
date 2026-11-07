@@ -200,7 +200,7 @@ def _tools(
         agent_id="astrbot",
         source_app="astrbot",
         identity="identity123",
-        plugin_version="0.18.0",
+        plugin_version="0.18.1",
         save_admin_only=save_admin_only,
         timeout_seconds=timeout_seconds,
     )
@@ -630,7 +630,7 @@ def test_status_reports_versions_attention_pending_and_last_sync() -> None:
     assert "attention_has_pending_reviews: true (非精确计数)" in result
     assert "pending: 1 (本会话)" in result
     assert "last_sync: 2026-11-07T10:00:00+00:00" in result
-    assert "plugin_version: 0.18.0" in result
+    assert "plugin_version: 0.18.1" in result
     assert client.attention_calls == 0
 
 

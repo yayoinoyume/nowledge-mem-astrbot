@@ -3,7 +3,7 @@
 把 [Nowledge Mem](https://mem.nowledge.co) 的上下文与长期记忆接入 AstrBot：每轮对话前注入 Context Bundle 与相关记忆召回，每轮结束后把新增消息增量写回同一个 Mem thread。
 
 - 插件名：`nowledge_mem_astrbot`
-- 版本：0.18.0
+- 版本：0.18.1
 - 要求：AstrBot >= 4.27.3
 
 ## 能力
