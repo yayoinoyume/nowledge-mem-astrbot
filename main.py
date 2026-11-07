@@ -3,23 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.star.filter.command import GreedyStr
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .core.capture import CaptureCoordinator, should_capture_turn
 from .core.client import NmemClient
 from .core.delta import digest_api_key, identity_digest
 from .core.inject import ContextInjector
+from .core.outbox import OutboxStore
 from .core.parts import make_temp_parts
 from .core.store import NmemStore
 from .core.tools import NmemTools
 
 _DEFAULT_API_URL = "http://127.0.0.1:14242"
-_PLUGIN_VERSION = "0.16.0"
+_PLUGIN_VERSION = "0.17.0"
+MEM_SUM_ROUNDS = 5
+MAX_SUMMARY_MESSAGE_CHARS = 1000
+MAX_SUMMARY_CHARS = 7000
 
 
 def _value(config: Any, key: str, default: Any) -> Any:
@@ -46,6 +54,23 @@ def _is_admin(event: AstrMessageEvent) -> bool:
         return bool(event.is_admin())
     except Exception:  # noqa: BLE001 - 判定失败必须落到拒绝
         return False
+
+
+def _message_text(value: Any) -> str:
+    """把 AstrBot 历史里的字符串/多段 content 统一成纯文本。"""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        text = value.get("text") or value.get("content")
+        return str(text or "").strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            text = _message_text(item)
+            if text:
+                parts.append(text)
+        return " ".join(parts)
+    return str(value or "").strip()
 
 
 def _flag(value: Any, default: bool) -> bool:
@@ -99,7 +124,18 @@ class NowledgeMemPlugin(Star):
             "", self._space_id, self._agent_id, self._client.api_url, api_key_digest
         )
         self._identity = identity
-        self._store = NmemStore(self, identity)
+        outbox_root = (
+            Path(get_astrbot_plugin_data_path())
+            / "nowledge_mem_astrbot"
+            / "outbox"
+        )
+        self._outbox = OutboxStore(outbox_root, identity, logger=self.logger)
+        self._store = NmemStore(
+            self,
+            identity,
+            outbox=self._outbox,
+            logger=self.logger,
+        )
         self._injector = ContextInjector(
             self._client,
             self._store,
@@ -143,6 +179,18 @@ class NowledgeMemPlugin(Star):
         )
         if not self._client.configured:
             self.logger.warning("Nowledge Mem 未配置 api_url 或 api_key，插件不会请求记忆服务")
+
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self) -> None:
+        """启动时加载离线 outbox；损坏文件只记 warning。"""
+        try:
+            count = await self._outbox.load()
+            if count:
+                self.logger.info("Nowledge Mem outbox 已加载 %s 条待同步", count)
+        except Exception as exc:
+            self.logger.warning(
+                "Nowledge Mem outbox 加载失败：%s", type(exc).__name__
+            )
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
@@ -203,6 +251,8 @@ class NowledgeMemPlugin(Star):
         scope: str = "memories",
         limit: int = 10,
         mode: str = "normal",
+        recorded_date_from: str = "",
+        recorded_date_to: str = "",
     ) -> str:
         """搜索 Nowledge Mem 里的记忆或历史对话，返回 id、标题、摘要、分数与来源 thread。
 
@@ -211,9 +261,18 @@ class NowledgeMemPlugin(Star):
             scope(string): memories 搜记忆、threads 搜历史对话、both 两者都搜；默认 memories
             limit(number): 最多返回几条，范围 1-20，默认 10
             mode(string): normal 或 deep，默认 normal；deep 更慢更细
+            recorded_date_from(string): 只要写入 Mem 的时间不早于此日期；YYYY-MM-DD 或 ISO 日期
+            recorded_date_to(string): 只要写入 Mem 的时间不晚于此日期；YYYY-MM-DD 或 ISO 日期
         """
         del event
-        return await self._tools.search(query, scope=scope, limit=limit, mode=mode)
+        return await self._tools.search(
+            query,
+            scope=scope,
+            limit=limit,
+            mode=mode,
+            recorded_date_from=recorded_date_from,
+            recorded_date_to=recorded_date_to,
+        )
 
     @filter.llm_tool(name="nowledge_mem_save")
     async def nowledge_mem_save(
@@ -251,6 +310,213 @@ class NowledgeMemPlugin(Star):
     async def nowledge_mem_status(self, event: AstrMessageEvent) -> str:
         """检查 Nowledge Mem 连接、当前身份、待同步数量与插件版本；不返回 API Key。"""
         return await self._tools.status(event.unified_msg_origin)
+
+    @filter.llm_tool(name="nowledge_mem_get")
+    async def nowledge_mem_get(
+        self,
+        event: AstrMessageEvent,
+        memory_id: str = "",
+    ) -> str:
+        """按 id 读取一条记忆的全文、标题、类型、重要度、标签与 metadata。
+
+        Args:
+            memory_id(string): 记忆 id，不能为空；通常来自 nowledge_mem_search 的结果
+        """
+        del event
+        return await self._tools.get_memory(memory_id)
+
+    @filter.llm_tool(name="nowledge_mem_thread_show")
+    async def nowledge_mem_thread_show(
+        self,
+        event: AstrMessageEvent,
+        thread_id: str = "",
+        offset: int = 0,
+        limit: int = 20,
+    ) -> str:
+        """读取一段历史对话的消息列表，单条内容最多返回 500 字。
+
+        Args:
+            thread_id(string): 对话 id，不能为空；通常来自 nowledge_mem_search 的 source_thread
+            offset(number): 跳过前几条消息，默认 0
+            limit(number): 最多返回几条，范围 1-100，默认 20
+        """
+        del event
+        return await self._tools.thread_show(
+            thread_id, offset=offset, limit=limit
+        )
+
+    @filter.llm_tool(name="nowledge_mem_graph")
+    async def nowledge_mem_graph(
+        self,
+        event: AstrMessageEvent,
+        query: str = "",
+        memory_id: str = "",
+        depth: int = 1,
+    ) -> str:
+        """从一条记忆出发探索知识图谱，返回相邻实体、关系和方向。
+
+        query 与 memory_id 必须且只能给一个；给 query 时先搜索最相关的一条记忆。
+
+        Args:
+            query(string): 要探索的主题；与 memory_id 二选一
+            memory_id(string): 已知记忆 id；与 query 二选一
+            depth(number): 扩展深度，范围 1-5，默认 1
+        """
+        del event
+        return await self._tools.graph(
+            query=query, memory_id=memory_id, depth=depth
+        )
+
+    @filter.llm_tool(name="nowledge_mem_skill")
+    async def nowledge_mem_skill(
+        self,
+        event: AstrMessageEvent,
+        name: str = "",
+    ) -> str:
+        """读取插件内置技能正文，按需加载记忆使用规范。
+
+        可用技能：read-working-memory、search-memory、distill-memory、status、save-thread。
+
+        Args:
+            name(string): 技能名，不能为空
+        """
+        del event
+        return await self._tools.skill(name)
+
+    async def _recent_history_text(
+        self, umo: str, max_rounds: int
+    ) -> tuple[str, int, int, str]:
+        """取当前会话最近最多 N 轮文本；返回 (正文, 消息数, 实际轮数, 标题)。"""
+        manager = getattr(self.context, "conversation_manager", None)
+        if manager is None:
+            return "", 0, 0, ""
+        cid = await manager.get_curr_conversation_id(umo)
+        if not cid:
+            return "", 0, 0, ""
+        conversation = await manager.get_conversation(umo, cid)
+        if conversation is None:
+            return "", 0, 0, ""
+        try:
+            items = json.loads(getattr(conversation, "history", "") or "[]")
+        except (TypeError, ValueError):
+            return "", 0, 0, ""
+        if not isinstance(items, list):
+            return "", 0, 0, ""
+        messages: list[tuple[str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            if role not in ("user", "assistant"):
+                continue
+            content = _message_text(item.get("content"))
+            if content:
+                messages.append((role, content))
+        selected = messages[-max(1, max_rounds) * 2 :]
+        if not selected:
+            return "", 0, 0, ""
+        actual_rounds = (len(selected) + 1) // 2
+        lines = [
+            f"{role}: {content[:MAX_SUMMARY_MESSAGE_CHARS]}"
+            for role, content in selected
+        ]
+        text = f"会话总结（最近 {actual_rounds} 轮）\n" + "\n".join(lines)
+        if len(text) > MAX_SUMMARY_CHARS:
+            text = text[:MAX_SUMMARY_CHARS]
+        first_user = next(
+            (content for role, content in selected if role == "user"), ""
+        )
+        title = "会话总结"
+        if first_user:
+            title = "会话总结 - " + " ".join(first_user.split())[:40]
+        return text, len(selected), actual_rounds, title
+
+    @filter.command("mem_search")
+    async def mem_search(
+        self, event: AstrMessageEvent, query: GreedyStr = GreedyStr
+    ) -> Any:
+        """搜索记忆，返回前 5 条标题与摘要。"""
+        try:
+            text = str(query or "").strip()
+            if not text:
+                yield event.plain_result("用法：/mem_search <查询内容>")
+                return
+            result = await self._tools.search(text, scope="memories", limit=5)
+        except Exception as exc:
+            result = f"error: 搜索失败：{type(exc).__name__}"
+        yield event.plain_result(result)
+
+    @filter.command("mem_save")
+    async def mem_save(
+        self, event: AstrMessageEvent, text: GreedyStr = GreedyStr
+    ) -> Any:
+        """保存一条记忆；默认 fact，可用 context 前缀指定类型。"""
+        try:
+            raw = str(text or "").strip()
+            unit_type = "fact"
+            lowered = raw.lower()
+            if lowered.startswith("context "):
+                unit_type = "context"
+                raw = raw[len("context ") :].strip()
+            elif lowered.startswith("fact "):
+                unit_type = "fact"
+                raw = raw[len("fact ") :].strip()
+            if not raw:
+                yield event.plain_result(
+                    "用法：/mem_save [fact|context] <要保存的内容>"
+                )
+                return
+            result = await self._tools.save(
+                raw,
+                unit_type=unit_type,
+                umo=event.unified_msg_origin,
+                sender_id=event.get_sender_id(),
+                is_admin=_is_admin(event),
+            )
+        except Exception as exc:
+            result = f"error: 保存失败：{type(exc).__name__}"
+        yield event.plain_result(result)
+
+    @filter.command("mem_status")
+    async def mem_status(self, event: AstrMessageEvent) -> Any:
+        """输出与 nowledge_mem_status 相同的连接与身份信息。"""
+        try:
+            result = await self._tools.status(event.unified_msg_origin)
+        except Exception as exc:
+            result = f"error: 状态检查失败：{type(exc).__name__}"
+        yield event.plain_result(result)
+
+    @filter.command("mem_sum")
+    async def mem_sum(self, event: AstrMessageEvent) -> Any:
+        """仅管理员：把当前会话最近 5 轮以内拼成一条 context 记忆。"""
+        if not _is_admin(event):
+            yield event.plain_result("error: 仅管理员可使用 /mem_sum")
+            return
+        try:
+            text, count, rounds, title = await self._recent_history_text(
+                event.unified_msg_origin, MEM_SUM_ROUNDS
+            )
+            if not text:
+                yield event.plain_result("error: 当前会话没有可总结的对话")
+                return
+            result = await self._tools.save(
+                text,
+                title=title,
+                unit_type="context",
+                importance=0.5,
+                labels=["会话总结"],
+                umo=event.unified_msg_origin,
+                sender_id=event.get_sender_id(),
+                is_admin=True,
+            )
+            if result.startswith("saved:"):
+                result += (
+                    f"\nnote: 已汇总最近 {rounds} 轮"
+                    f"（{count} 条消息）"
+                )
+        except Exception as exc:
+            result = f"error: 会话总结失败：{type(exc).__name__}"
+        yield event.plain_result(result)
 
     async def terminate(self) -> None:
         try:

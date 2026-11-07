@@ -32,6 +32,15 @@ class FakeToolClient:
         health_details_error=None,
         attention_result=None,
         attention_error=None,
+        get_memory_result=None,
+        thread_result=None,
+        graph_result=None,
+        get_memory_error=None,
+        thread_error=None,
+        graph_error=None,
+        working_memory_result=None,
+        working_memory_error=None,
+        bundle_error=None,
     ) -> None:
         self.configured = True
         self.api_url = "http://mem.local:14242"
@@ -51,8 +60,41 @@ class FakeToolClient:
         self.health_details_error = health_details_error
         self.attention_result = attention_result
         self.attention_error = attention_error
+        self.get_memory_result = get_memory_result or {
+            "id": "m1",
+            "title": "标题",
+            "content": "正文",
+            "unit_type": "fact",
+            "importance": 0.6,
+            "labels": [],
+            "metadata": {},
+        }
+        self.thread_result = thread_result or {
+            "thread": {"thread_id": "t1", "title": "对话"},
+            "messages": [],
+            "total_messages": 0,
+        }
+        self.graph_result = graph_result or {
+            "center_node": "m1",
+            "depth": 1,
+            "neighbors": [],
+            "edges": [],
+            "metadata": {},
+        }
+        self.get_memory_error = get_memory_error
+        self.thread_error = thread_error
+        self.graph_error = graph_error
+        self.working_memory_result = working_memory_result or {
+            "rendered_markdown": "# WM"
+        }
+        self.working_memory_error = working_memory_error
+        self.bundle_error = bundle_error
+        self.working_memory_calls = 0
         self.search_calls: list[dict] = []
         self.thread_calls: list[dict] = []
+        self.get_memory_calls: list[dict] = []
+        self.show_thread_calls: list[dict] = []
+        self.graph_calls: list[dict] = []
         self.save_calls: list[dict] = []
         self.health_calls = 0
         self.health_details_calls = 0
@@ -72,6 +114,30 @@ class FakeToolClient:
         if self.threads_response is not None:
             return self.threads_response
         return {"threads": list(self.threads), "total_found": len(self.threads)}
+
+    async def get_memory(self, memory_id, **kwargs):
+        self.get_memory_calls.append({"memory_id": memory_id, **kwargs})
+        if self.get_memory_error:
+            raise self.get_memory_error
+        return dict(self.get_memory_result)
+
+    async def get_thread(self, thread_id, **kwargs):
+        self.show_thread_calls.append({"thread_id": thread_id, **kwargs})
+        if self.thread_error:
+            raise self.thread_error
+        return dict(self.thread_result)
+
+    async def expand_graph(self, node_id, **kwargs):
+        self.graph_calls.append({"node_id": node_id, **kwargs})
+        if self.graph_error:
+            raise self.graph_error
+        return dict(self.graph_result)
+
+    async def working_memory(self, **kwargs):
+        self.working_memory_calls += 1
+        if self.working_memory_error:
+            raise self.working_memory_error
+        return dict(self.working_memory_result)
 
     async def save_memory(self, content, **kwargs):
         self.save_calls.append({"content": content, **kwargs})
@@ -99,6 +165,8 @@ class FakeToolClient:
 
     async def context_bundle(self, **kwargs):
         self.bundle_calls += 1
+        if self.bundle_error:
+            raise self.bundle_error
         return {"rendered_markdown": "# H"}
 
 
@@ -116,7 +184,7 @@ def _tools(
         agent_id="astrbot",
         source_app="astrbot",
         identity="identity123",
-        plugin_version="0.16.0",
+        plugin_version="0.17.0",
         save_admin_only=save_admin_only,
         timeout_seconds=timeout_seconds,
     )
@@ -354,7 +422,7 @@ def test_status_reports_versions_attention_pending_and_last_sync() -> None:
     assert "attention_has_pending_reviews: true (非精确计数)" in result
     assert "pending: 1 (本会话)" in result
     assert "last_sync: 2026-11-07T10:00:00+00:00" in result
-    assert "plugin_version: 0.16.0" in result
+    assert "plugin_version: 0.17.0" in result
     assert client.attention_calls == 0
 
 
@@ -536,3 +604,336 @@ def test_search_deep_doubles_timeout_and_caps_at_15() -> None:
     asyncio.run(_tools(client, timeout_seconds=10).search("查询", mode="deep"))
     asyncio.run(_tools(client, timeout_seconds=2).search("查询", mode="normal"))
     assert [call["timeout"] for call in client.search_calls] == [4, 15, 2]
+
+
+def test_get_memory_formats_full_detail() -> None:
+    client = FakeToolClient(
+        get_memory_result={
+            "id": "m1",
+            "title": "决策标题",
+            "content": "第一行\n第二行",
+            "unit_type": "decision",
+            "importance": 0.75,
+            "labels": ["alpha", "beta"],
+            "metadata": {"source_umo": "qq:group:1"},
+            "source_thread": {"id": "t9", "title": "来源"},
+        }
+    )
+    result = asyncio.run(_tools(client).get_memory("m1"))
+    assert "memory: id=m1" in result
+    assert "title: 决策标题" in result
+    assert "unit_type: decision" in result
+    assert "importance: 0.75" in result
+    assert "labels: alpha, beta" in result
+    assert '"source_umo": "qq:group:1"' in result
+    assert "source_thread: t9" in result
+    assert "第一行\n第二行" in result
+    assert client.get_memory_calls[0] == {"memory_id": "m1", "space_id": "space"}
+
+
+def test_get_memory_falls_back_to_label_ids_and_empty_metadata() -> None:
+    client = FakeToolClient(
+        get_memory_result={
+            "id": "m1",
+            "title": "",
+            "content": "",
+            "unit_type": "fact",
+            "importance": 0.4,
+            "label_ids": ["label_a"],
+        }
+    )
+    result = asyncio.run(_tools(client).get_memory("m1"))
+    assert "title: (无标题)" in result
+    assert "labels: label_a" in result
+    assert "metadata: {}" in result
+    assert "content:\n(空)" in result
+
+
+def test_get_memory_rejects_empty_id() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).get_memory("  "))
+    assert result == "error: memory_id 不能为空"
+    assert client.get_memory_calls == []
+
+
+def test_get_memory_http_error_is_reported() -> None:
+    client = FakeToolClient(
+        get_memory_error=NmemError("HTTP 404", status=404)
+    )
+    result = asyncio.run(_tools(client).get_memory("m1"))
+    assert result.startswith("error: Nowledge Mem 读取记忆失败：HTTP 404")
+
+
+def test_get_memory_timeout_is_reported() -> None:
+    client = FakeToolClient(
+        get_memory_error=NmemError("请求失败：TimeoutError")
+    )
+    result = asyncio.run(_tools(client).get_memory("m1"))
+    assert result.startswith("error: Nowledge Mem 读取记忆失败：请求失败：TimeoutError")
+
+
+def test_thread_show_formats_and_truncates_content() -> None:
+    client = FakeToolClient(
+        thread_result={
+            "thread": {"thread_id": "t1", "title": "旧对话"},
+            "messages": [
+                {"role": "user", "content": "x" * 600},
+                {"role": "assistant", "content": "收到"},
+            ],
+            "total_messages": 42,
+        }
+    )
+    result = asyncio.run(_tools(client).thread_show("t1", offset=5, limit=10))
+    assert "thread: id=t1 title=旧对话" in result
+    assert "total_messages: 42" in result
+    assert "range: offset=5 limit=10 returned=2" in result
+    assert "1. [user] " + "x" * 499 + "…" in result
+    assert "2. [assistant] 收到" in result
+    assert client.show_thread_calls[0] == {
+        "thread_id": "t1",
+        "offset": 5,
+        "limit": 10,
+        "space_id": "space",
+    }
+
+
+def test_thread_show_clamps_range() -> None:
+    client = FakeToolClient()
+    asyncio.run(_tools(client).thread_show("t1", offset=-5, limit=999))
+    asyncio.run(_tools(client).thread_show("t1", limit=0))
+    assert client.show_thread_calls[0]["offset"] == 0
+    assert client.show_thread_calls[0]["limit"] == 100
+    assert client.show_thread_calls[1]["limit"] == 1
+
+
+def test_thread_show_empty_messages() -> None:
+    result = asyncio.run(_tools().thread_show("t1"))
+    assert "messages: (empty)" in result
+
+
+def test_thread_show_rejects_empty_id() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).thread_show("  "))
+    assert result == "error: thread_id 不能为空"
+    assert client.show_thread_calls == []
+
+
+def test_thread_show_http_error_is_reported() -> None:
+    client = FakeToolClient(thread_error=NmemError("HTTP 500", status=500))
+    result = asyncio.run(_tools(client).thread_show("t1"))
+    assert result.startswith("error: Nowledge Mem 读取对话失败：HTTP 500")
+
+
+def test_thread_show_timeout_is_reported() -> None:
+    client = FakeToolClient(thread_error=NmemError("请求失败：TimeoutError"))
+    result = asyncio.run(_tools(client).thread_show("t1"))
+    assert result.startswith("error: Nowledge Mem 读取对话失败：请求失败：TimeoutError")
+
+
+def test_graph_by_memory_id_formats_neighbors_and_edges() -> None:
+    client = FakeToolClient(
+        graph_result={
+            "center_node": "m1",
+            "depth": 2,
+            "neighbors": [
+                {"id": "e1", "label": "大肥鱼", "node_type": "entity"}
+            ],
+            "edges": [
+                {
+                    "source": "m1",
+                    "target": "e1",
+                    "edge_type": "MENTIONS",
+                    "label": "提到",
+                }
+            ],
+            "metadata": {},
+        }
+    )
+    result = asyncio.run(_tools(client).graph(memory_id="m1", depth=2))
+    assert "graph: center=m1 depth=2 neighbors=1 edges=1" in result
+    assert "- [entity] 大肥鱼 (id=e1)" in result
+    assert "- m1 -> e1 [MENTIONS] 提到" in result
+    assert client.graph_calls[0] == {
+        "node_id": "m1",
+        "depth": 2,
+        "limit": 50,
+        "space_id": "space",
+    }
+
+
+def test_graph_by_query_searches_first() -> None:
+    client = FakeToolClient(
+        memories=[_memory(id="m9", title="主题")],
+        graph_result={
+            "center_node": "m9",
+            "depth": 1,
+            "neighbors": [],
+            "edges": [],
+            "metadata": {},
+        },
+    )
+    result = asyncio.run(_tools(client).graph(query="主题"))
+    assert "matched: id=m9 title=主题" in result
+    assert "无邻居或节点不存在" in result
+    assert client.search_calls[0]["limit"] == 1
+    assert client.graph_calls[0]["node_id"] == "m9"
+
+
+def test_graph_no_matches_does_not_expand() -> None:
+    client = FakeToolClient(memories=[])
+    result = asyncio.run(_tools(client).graph(query="查不到"))
+    assert result.startswith('no matches: query="查不到"')
+    assert client.graph_calls == []
+
+
+def test_graph_requires_exactly_one_of_query_and_memory_id() -> None:
+    client = FakeToolClient()
+    assert asyncio.run(_tools(client).graph()).startswith("error: query 与 memory_id")
+    assert asyncio.run(
+        _tools(client).graph(query="主题", memory_id="m1")
+    ).startswith("error: query 与 memory_id")
+    assert client.search_calls == []
+    assert client.graph_calls == []
+
+
+def test_graph_clamps_depth() -> None:
+    client = FakeToolClient()
+    asyncio.run(_tools(client).graph(memory_id="m1", depth=9))
+    asyncio.run(_tools(client).graph(memory_id="m1", depth=0))
+    assert client.graph_calls[0]["depth"] == 5
+    assert client.graph_calls[1]["depth"] == 1
+
+
+def test_graph_metadata_error_is_reported() -> None:
+    client = FakeToolClient(
+        graph_result={
+            "center_node": "m1",
+            "depth": 1,
+            "neighbors": [],
+            "edges": [],
+            "metadata": {"error": "boom"},
+        }
+    )
+    result = asyncio.run(_tools(client).graph(memory_id="m1"))
+    assert result == "error: 图扩展失败：boom"
+
+
+def test_graph_http_error_is_reported() -> None:
+    client = FakeToolClient(graph_error=NmemError("HTTP 500", status=500))
+    result = asyncio.run(_tools(client).graph(memory_id="m1"))
+    assert result.startswith("error: Nowledge Mem 图探索失败：HTTP 500")
+
+
+def test_graph_timeout_is_reported() -> None:
+    client = FakeToolClient(graph_error=NmemError("请求失败：TimeoutError"))
+    result = asyncio.run(_tools(client).graph(memory_id="m1"))
+    assert result.startswith("error: Nowledge Mem 图探索失败：请求失败：TimeoutError")
+
+
+def test_skill_reads_existing_body_without_frontmatter() -> None:
+    result = asyncio.run(_tools().skill("search-memory"))
+    assert result.startswith("skill: search-memory")
+    assert "## 什么时候搜" in result
+    assert not result.startswith("---")
+
+
+def test_skill_unknown_name_lists_available() -> None:
+    result = asyncio.run(_tools().skill("unknown"))
+    assert result.startswith("error: 未知技能 unknown")
+    assert "search-memory" in result
+
+
+def test_skill_empty_name_is_error() -> None:
+    result = asyncio.run(_tools().skill("  "))
+    assert result.startswith("error: name 不能为空")
+
+
+def test_skill_missing_file_is_error(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("core.tools.SKILLS_DIR", tmp_path)
+    result = asyncio.run(_tools().skill("status"))
+    assert result == "error: 技能文件不存在：status"
+
+
+def test_search_passes_recorded_date_window() -> None:
+    client = FakeToolClient(memories=[_memory()])
+    asyncio.run(
+        _tools(client).search(
+            "查询",
+            recorded_date_from="2026-11-01",
+            recorded_date_to="2026-11-30",
+        )
+    )
+    call = client.search_calls[0]
+    assert call["recorded_date_from"] == "2026-11-01"
+    assert call["recorded_date_to"] == "2026-11-30"
+
+
+def test_search_accepts_iso_datetime_and_normalizes() -> None:
+    client = FakeToolClient(memories=[_memory()])
+    asyncio.run(
+        _tools(client).search(
+            "查询", recorded_date_from="2026-11-07T10:00:00+08:00"
+        )
+    )
+    assert client.search_calls[0]["recorded_date_from"] == "2026-11-07"
+
+
+def test_search_rejects_invalid_date() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(
+        _tools(client).search("查询", recorded_date_from="2026/11/07")
+    )
+    assert result.startswith("error: recorded_date_from 必须是")
+    assert client.search_calls == []
+
+
+def test_search_rejects_reversed_date_range() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(
+        _tools(client).search(
+            "查询",
+            recorded_date_from="2026-12-31",
+            recorded_date_to="2026-01-01",
+        )
+    )
+    assert result == "error: recorded_date_from 不能晚于 recorded_date_to"
+    assert client.search_calls == []
+
+
+def test_search_defaults_empty_recorded_date_window() -> None:
+    client = FakeToolClient(memories=[_memory()])
+    asyncio.run(_tools(client).search("查询"))
+    call = client.search_calls[0]
+    assert call["recorded_date_from"] == ""
+    assert call["recorded_date_to"] == ""
+
+
+def test_get_memory_strips_file_path_recursively() -> None:
+    client = FakeToolClient(
+        get_memory_result={
+            "id": "m1",
+            "title": "标题",
+            "content": "正文",
+            "unit_type": "fact",
+            "importance": 0.5,
+            "metadata": {
+                "file_path": "/srv/secret/a.md",
+                "nested": [{"file_path": "/srv/secret/b.md", "keep": 1}],
+            },
+        }
+    )
+    result = asyncio.run(_tools(client).get_memory("m1"))
+    assert "/srv/secret" not in result
+    assert '"keep": 1' in result
+
+
+def test_status_falls_back_to_working_memory_on_404() -> None:
+    client = FakeToolClient(
+        health_details_error=NmemError("HTTP 404", status=404),
+        health_error=NmemError("HTTP 404", status=404),
+        bundle_error=NmemError("HTTP 404", status=404),
+    )
+    result = asyncio.run(_tools(client).status("umo"))
+    assert "connected: true" in result
+    assert "backend: /agent/working-memory" in result
+    assert client.working_memory_calls == 1

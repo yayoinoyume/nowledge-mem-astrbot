@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -16,6 +19,20 @@ MAX_TITLE_CHARS = 200
 MAX_LABEL_CHARS = 64
 MAX_LABELS = 20
 MAX_SEARCH_TIMEOUT_SECONDS = 15.0
+MAX_THREAD_LIMIT = 100
+MAX_THREAD_CONTENT_CHARS = 500
+MAX_GRAPH_DEPTH = 5
+GRAPH_NEIGHBOR_LIMIT = 50
+MAX_GRAPH_LINES = 50
+MAX_SKILL_CHARS = 20_000
+SKILL_NAMES = (
+    "read-working-memory",
+    "search-memory",
+    "distill-memory",
+    "status",
+    "save-thread",
+)
+SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 VALID_SCOPES = ("memories", "threads", "both")
 VALID_MODES = ("normal", "deep")
 VALID_UNIT_TYPES = (
@@ -118,6 +135,93 @@ def _clamp_limit(value: Any, default: int = 10) -> int:
     except (TypeError, ValueError, OverflowError):
         return default
     return max(1, min(20, number))
+
+
+def _limit(value: Any, default: int, low: int, high: int) -> int:
+    """数值参数越界时夹到区间内；非法值回落默认值。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(low, min(high, number))
+
+
+def _normalize_date(value: Any) -> tuple[str, str]:
+    """接受 YYYY-MM-DD 或 ISO 日期时间；返回 (YYYY-MM-DD, 错误说明)。"""
+    text = str(value or "").strip()
+    if not text:
+        return "", ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return "", "必须是 YYYY-MM-DD 或 ISO 日期"
+    return parsed.date().isoformat(), ""
+
+
+def _one_line(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def _strip_frontmatter(text: str) -> str:
+    if not text.startswith("---"):
+        return text
+    parts = text.split("---", 2)
+    if len(parts) == 3:
+        return parts[2].lstrip("\n")
+    return text
+
+
+def _strip_file_paths(value: Any) -> Any:
+    """递归剔除服务端绝对路径字段，避免 file_path 泄漏。"""
+    if isinstance(value, dict):
+        return {
+            key: _strip_file_paths(item)
+            for key, item in value.items()
+            if key != "file_path"
+        }
+    if isinstance(value, list):
+        return [_strip_file_paths(item) for item in value]
+    return value
+
+
+def _format_memory_detail(data: dict[str, Any]) -> str:
+    memory_id = str(data.get("id") or "?").strip()
+    title = str(data.get("title") or "").strip() or "(无标题)"
+    unit_type = str(data.get("unit_type") or "memory").strip()
+    importance = _number(data.get("importance"))
+    raw_labels = data.get("labels")
+    if not isinstance(raw_labels, list):
+        raw_labels = data.get("label_ids")
+    if not isinstance(raw_labels, list):
+        raw_labels = []
+    labels = [str(item).strip() for item in raw_labels if str(item).strip()]
+    source_thread = (
+        _thread_id(data.get("source_thread"))
+        or _thread_id(data.get("source_thread_id"))
+    )
+    metadata = _strip_file_paths(data.get("metadata"))
+    metadata_text = (
+        json.dumps(metadata, ensure_ascii=False, indent=2, default=str)
+        if isinstance(metadata, dict) and metadata
+        else "{}"
+    )
+    content = str(data.get("content") or "")
+    lines = [
+        f"memory: id={memory_id}",
+        f"title: {title}",
+        f"unit_type: {unit_type}",
+        f"importance: {importance:.2f}",
+        f"labels: {', '.join(labels) if labels else '(none)'}",
+        f"metadata: {metadata_text}",
+    ]
+    if source_thread:
+        lines.append(f"source_thread: {source_thread}")
+    lines.append("content:")
+    lines.append(content if content else "(空)")
+    return "\n".join(lines)
 
 
 def _labels(value: Any) -> list[str]:
@@ -243,6 +347,8 @@ class NmemTools:
         scope: str = "memories",
         limit: int = 10,
         mode: str = "normal",
+        recorded_date_from: str = "",
+        recorded_date_to: str = "",
     ) -> str:
         try:
             text = str(query or "").strip()
@@ -256,6 +362,21 @@ class NmemTools:
                 return "error: mode 必须是 normal 或 deep"
             count = _clamp_limit(limit)
             timeout = _search_timeout(mode_text, self._timeout_seconds)
+            dates: dict[str, str] = {}
+            for name, value in (
+                ("recorded_date_from", recorded_date_from),
+                ("recorded_date_to", recorded_date_to),
+            ):
+                normalized, date_error = _normalize_date(value)
+                if date_error:
+                    return f"error: {name} {date_error}"
+                dates[name] = normalized
+            if (
+                dates["recorded_date_from"]
+                and dates["recorded_date_to"]
+                and dates["recorded_date_from"] > dates["recorded_date_to"]
+            ):
+                return "error: recorded_date_from 不能晚于 recorded_date_to"
             collected: list[tuple[str, dict[str, Any]]] = []
             if scope_text in ("memories", "both"):
                 memories = await self._client.search(
@@ -263,6 +384,8 @@ class NmemTools:
                     limit=count,
                     space_id=self._space_id,
                     mode=mode_text,
+                    recorded_date_from=dates["recorded_date_from"],
+                    recorded_date_to=dates["recorded_date_to"],
                     timeout=timeout,
                 )
                 collected.extend(("memory", item) for item in memories)
@@ -367,6 +490,187 @@ class NmemTools:
             self._logger.warning("nowledge_mem_save 失败：%s", type(exc).__name__)
             return f"error: 保存失败：{type(exc).__name__}: {exc}"
 
+    async def get_memory(self, memory_id: str) -> str:
+        try:
+            text = str(memory_id or "").strip()
+            if not text:
+                return "error: memory_id 不能为空"
+            data = await self._client.get_memory(text, space_id=self._space_id)
+            return _format_memory_detail(data)
+        except NmemError as exc:
+            return f"error: Nowledge Mem 读取记忆失败：{exc}"
+        except Exception as exc:
+            self._logger.warning("nowledge_mem_get 失败：%s", type(exc).__name__)
+            return f"error: 读取记忆失败：{type(exc).__name__}: {exc}"
+
+    async def thread_show(
+        self,
+        thread_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> str:
+        try:
+            text = str(thread_id or "").strip()
+            if not text:
+                return "error: thread_id 不能为空"
+            start = _limit(offset, 0, 0, 1_000_000)
+            count = _limit(limit, 20, 1, MAX_THREAD_LIMIT)
+            data = await self._client.get_thread(
+                text,
+                offset=start,
+                limit=count,
+                space_id=self._space_id,
+            )
+            thread = data.get("thread")
+            if not isinstance(thread, dict):
+                thread = {}
+            messages = data.get("messages")
+            if not isinstance(messages, list):
+                messages = []
+            total = data.get("total_messages")
+            if not isinstance(total, int):
+                total = thread.get("message_count")
+            if not isinstance(total, int):
+                total = len(messages)
+            resolved_id = (
+                str(thread.get("thread_id") or thread.get("id") or text).strip()
+            )
+            title = str(thread.get("title") or "").strip() or "(无标题)"
+            lines = [
+                f"thread: id={resolved_id} title={title}",
+                f"total_messages: {total}",
+                f"range: offset={start} limit={count} returned={len(messages)}",
+            ]
+            if not messages:
+                lines.append("messages: (empty)")
+                return "\n".join(lines)
+            for index, message in enumerate(messages, start=1):
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role") or "unknown").strip()
+                content = _one_line(
+                    message.get("content"), MAX_THREAD_CONTENT_CHARS
+                ) or "(空)"
+                lines.append(f"{index}. [{role}] {content}")
+            return "\n".join(lines)
+        except NmemError as exc:
+            return f"error: Nowledge Mem 读取对话失败：{exc}"
+        except Exception as exc:
+            self._logger.warning("nowledge_mem_thread_show 失败：%s", type(exc).__name__)
+            return f"error: 读取对话失败：{type(exc).__name__}: {exc}"
+
+    async def graph(
+        self,
+        *,
+        query: str = "",
+        memory_id: str = "",
+        depth: int = 1,
+    ) -> str:
+        try:
+            text = str(query or "").strip()
+            center = str(memory_id or "").strip()
+            if bool(text) == bool(center):
+                return "error: query 与 memory_id 必须且只能给一个"
+            level = _limit(depth, 1, 1, MAX_GRAPH_DEPTH)
+            matched = ""
+            center_title = ""
+            if text:
+                results = await self._client.search(
+                    text,
+                    limit=1,
+                    space_id=self._space_id,
+                    mode="normal",
+                )
+                if not results:
+                    return f'no matches: query="{text}"'
+                first = results[0] if isinstance(results[0], dict) else {}
+                center = str(first.get("id") or "").strip()
+                if not center:
+                    return "error: 搜索结果缺少 memory id"
+                center_title = _preview(first.get("title"), MAX_TITLE_CHARS)
+                matched = (
+                    f"matched: id={center} title={center_title or '(无标题)'}"
+                )
+            data = await self._client.expand_graph(
+                center,
+                depth=level,
+                limit=GRAPH_NEIGHBOR_LIMIT,
+                space_id=self._space_id,
+            )
+            metadata = data.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("error"):
+                return f"error: 图扩展失败：{metadata['error']}"
+            neighbors = data.get("neighbors")
+            if not isinstance(neighbors, list):
+                neighbors = []
+            edges = data.get("edges")
+            if not isinstance(edges, list):
+                edges = []
+            lines = [
+                f"graph: center={center} depth={level} "
+                f"neighbors={len(neighbors)} edges={len(edges)}"
+            ]
+            if matched:
+                lines.insert(0, matched)
+            if not neighbors and not edges:
+                lines.append("no relations: 无邻居或节点不存在")
+                return "\n".join(lines)
+            if neighbors:
+                lines.append("neighbors:")
+                for item in neighbors[:MAX_GRAPH_LINES]:
+                    if not isinstance(item, dict):
+                        continue
+                    node_id = str(item.get("id") or "?").strip()
+                    label = _preview(
+                        item.get("label") or item.get("title"), MAX_TITLE_CHARS
+                    ) or "(无标签)"
+                    node_type = str(item.get("node_type") or "node").strip()
+                    lines.append(f"- [{node_type}] {label} (id={node_id})")
+            if edges:
+                lines.append("edges:")
+                for item in edges[:MAX_GRAPH_LINES]:
+                    if not isinstance(item, dict):
+                        continue
+                    source = str(item.get("source") or "?").strip()
+                    target = str(item.get("target") or "?").strip()
+                    edge_type = str(item.get("edge_type") or "related").strip()
+                    label = _preview(item.get("label"), MAX_TITLE_CHARS)
+                    line = f"- {source} -> {target} [{edge_type}]"
+                    if label:
+                        line += f" {label}"
+                    lines.append(line)
+            return "\n".join(lines)
+        except NmemError as exc:
+            return f"error: Nowledge Mem 图探索失败：{exc}"
+        except Exception as exc:
+            self._logger.warning("nowledge_mem_graph 失败：%s", type(exc).__name__)
+            return f"error: 图探索失败：{type(exc).__name__}: {exc}"
+
+    async def skill(self, name: str) -> str:
+        try:
+            key = str(name or "").strip().lower()
+            available = "、".join(SKILL_NAMES)
+            if not key:
+                return f"error: name 不能为空；可用技能：{available}"
+            if key not in SKILL_NAMES:
+                return f"error: 未知技能 {key}；可用技能：{available}"
+            path = SKILLS_DIR / key / "SKILL.md"
+            if not path.is_file():
+                return f"error: 技能文件不存在：{key}"
+            body = _strip_frontmatter(path.read_text(encoding="utf-8")).strip()
+            if not body:
+                return f"error: 技能正文为空：{key}"
+            if len(body) > MAX_SKILL_CHARS:
+                body = body[:MAX_SKILL_CHARS] + "\n…"
+            return f"skill: {key}\n\n{body}"
+        except OSError as exc:
+            self._logger.warning("nowledge_mem_skill 读取失败：%s", type(exc).__name__)
+            return f"error: 读取技能失败：{type(exc).__name__}"
+        except Exception as exc:
+            self._logger.warning("nowledge_mem_skill 失败：%s", type(exc).__name__)
+            return f"error: 读取技能失败：{type(exc).__name__}: {exc}"
+
     async def status(self, umo: str = "") -> str:
         connected = False
         backend = ""
@@ -394,7 +698,14 @@ class NmemTools:
                                 connected = True
                                 backend = "/context/bundle"
                             except NmemError as bundle_error:
-                                error = str(bundle_error)
+                                try:
+                                    await self._client.working_memory(
+                                        space_id=self._space_id
+                                    )
+                                    connected = True
+                                    backend = "/agent/working-memory"
+                                except NmemError as wm_error:
+                                    error = str(wm_error)
                         else:
                             error = str(fallback)
                 else:

@@ -67,6 +67,22 @@ class FakeSession:
         return self.responses.pop(0)
 
 
+class FakeKV:
+    """AstrBot 插件级 KV 的最小替身。"""
+
+    def __init__(self) -> None:
+        self.data: dict[str, Any] = {}
+
+    async def get_kv_data(self, key: str, default: Any = None) -> Any:
+        return self.data.get(key, default)
+
+    async def put_kv_data(self, key: str, value: Any) -> None:
+        self.data[key] = value
+
+    async def delete_kv_data(self, key: str) -> None:
+        self.data.pop(key, None)
+
+
 class FakeCaptureClient:
     def __init__(self, responses: list[dict[str, Any]]) -> None:
         self.responses = list(responses)

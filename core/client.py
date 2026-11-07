@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import aiohttp
 
@@ -294,11 +294,19 @@ class NmemClient:
         limit: int,
         space_id: str,
         mode: str = "normal",
+        recorded_date_from: str = "",
+        recorded_date_to: str = "",
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         body: dict[str, Any] = {"query": query, "limit": limit, "mode": mode}
         if space_id:
             body["space_id"] = space_id
+        for key, value in (
+            ("recorded_date_from", recorded_date_from),
+            ("recorded_date_to", recorded_date_to),
+        ):
+            if value:
+                body[key] = value
         data = await self._request_strict(
             "POST",
             "/memories/search",
@@ -325,6 +333,127 @@ class NmemClient:
             params=params,
         )
         return normalize_threads_response(data)
+
+    async def get_memory(
+        self,
+        memory_id: str,
+        *,
+        space_id: str = "",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if space_id:
+            params["space_id"] = space_id
+        data = await self._request_strict(
+            "GET",
+            f"/memories/{quote(memory_id, safe='')}",
+            timeout=self._timeout if timeout is None else timeout,
+            params=params or None,
+        )
+        if not isinstance(data, dict):
+            raise NmemError("记忆详情响应不是对象")
+        return data
+
+    async def get_thread(
+        self,
+        thread_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+        space_id: str = "",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"offset": offset, "limit": limit}
+        if space_id:
+            params["space_id"] = space_id
+        data = await self._request_strict(
+            "GET",
+            f"/threads/{quote(thread_id, safe='')}",
+            timeout=self._timeout if timeout is None else timeout,
+            params=params,
+        )
+        if not isinstance(data, dict):
+            raise NmemError("thread 详情响应不是对象")
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            raise NmemError("thread 详情响应缺少 messages 列表")
+        # related_memories / entities 不随分页变化且体积很大，直接丢弃。
+        thread = data.get("thread")
+        total = data.get("total_messages")
+        return {
+            "thread": thread if isinstance(thread, dict) else {},
+            "messages": messages,
+            "total_messages": total if isinstance(total, int) else len(messages),
+        }
+
+    async def expand_graph(
+        self,
+        node_id: str,
+        *,
+        depth: int = 1,
+        limit: int = 50,
+        space_id: str = "",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "depth": depth,
+            "limit": limit,
+            "include_metadata": "true",
+        }
+        if space_id:
+            params["space_id"] = space_id
+        data = await self._request_strict(
+            "GET",
+            f"/graph/expand/{quote(node_id, safe='')}",
+            timeout=self._timeout if timeout is None else timeout,
+            params=params,
+        )
+        if not isinstance(data, dict):
+            raise NmemError("图扩展响应不是对象")
+        return data
+
+    async def evolves(
+        self,
+        memory_id: str,
+        *,
+        limit: int = 20,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """GET /agent/evolves。
+
+        注意：该端点没有 space_id，实测会跨空间返回；插件工具不暴露它，
+        只在需要版本链时由调用方显式使用并自行标注风险。
+        """
+        data = await self._request_strict(
+            "GET",
+            "/agent/evolves",
+            timeout=self._timeout if timeout is None else timeout,
+            params={"memory_id": memory_id, "limit": limit},
+        )
+        if not isinstance(data, dict):
+            raise NmemError("EVOLVES 响应不是对象")
+        return data
+
+    async def working_memory(
+        self,
+        *,
+        space_id: str = "",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if space_id:
+            params["space_id"] = space_id
+        data = await self._request_strict(
+            "GET",
+            "/agent/working-memory",
+            timeout=self._timeout if timeout is None else timeout,
+            params=params or None,
+        )
+        if not isinstance(data, dict):
+            raise NmemError("Working Memory 响应不是对象")
+        # 服务端会带绝对路径；插件不展示 WM 正文，也不保留这个字段。
+        data.pop("file_path", None)
+        return data
 
     async def save_memory(
         self,

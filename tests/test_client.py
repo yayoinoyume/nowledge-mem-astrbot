@@ -342,3 +342,157 @@ def test_save_memory_posts_provenance_fields() -> None:
         "source_umo": "qq:group:1",
         "sender_hash": "0123456789abcdef",
     }
+
+
+def test_get_memory_uses_get_and_space_guard() -> None:
+    session = FakeSession([FakeResponse(200, {"id": "m1", "content": "正文"})])
+    client = _client(session)
+    result = asyncio.run(client.get_memory("m1", space_id="space"))
+    assert result["id"] == "m1"
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "http://127.0.0.1:14242/memories/m1"
+    assert call["kwargs"]["params"] == {"space_id": "space"}
+
+
+def test_get_memory_quotes_id_and_omits_empty_space() -> None:
+    session = FakeSession([FakeResponse(200, {"id": "a/b"})])
+    client = _client(session)
+    asyncio.run(client.get_memory("a/b"))
+    call = session.calls[0]
+    assert call["url"] == "http://127.0.0.1:14242/memories/a%2Fb"
+    assert call["kwargs"]["params"] is None
+
+
+def test_get_memory_non_object_raises() -> None:
+    session = FakeSession([FakeResponse(200, [])])
+    client = _client(session)
+    with pytest.raises(NmemError):
+        asyncio.run(client.get_memory("m1"))
+
+
+def test_get_thread_passes_range_and_returns_messages() -> None:
+    session = FakeSession([
+        FakeResponse(200, {"thread": {"thread_id": "t1"}, "messages": [], "total_messages": 0})
+    ])
+    client = _client(session)
+    result = asyncio.run(
+        client.get_thread("t1", offset=5, limit=10, space_id="space")
+    )
+    assert result["total_messages"] == 0
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "http://127.0.0.1:14242/threads/t1"
+    assert call["kwargs"]["params"] == {
+        "offset": 5,
+        "limit": 10,
+        "space_id": "space",
+    }
+
+
+def test_get_thread_missing_messages_raises() -> None:
+    session = FakeSession([FakeResponse(200, {"thread": {}})])
+    client = _client(session)
+    with pytest.raises(NmemError):
+        asyncio.run(client.get_thread("t1"))
+
+
+def test_expand_graph_passes_depth_limit_and_space() -> None:
+    session = FakeSession([
+        FakeResponse(200, {"center_node": "m1", "neighbors": [], "edges": []})
+    ])
+    client = _client(session)
+    result = asyncio.run(
+        client.expand_graph("m1", depth=2, limit=10, space_id="space")
+    )
+    assert result["center_node"] == "m1"
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "http://127.0.0.1:14242/graph/expand/m1"
+    assert call["kwargs"]["params"] == {
+        "depth": 2,
+        "limit": 10,
+        "include_metadata": "true",
+        "space_id": "space",
+    }
+
+
+def test_get_thread_drops_related_memories_and_entities() -> None:
+    session = FakeSession([
+        FakeResponse(
+            200,
+            {
+                "thread": {"thread_id": "t1"},
+                "messages": [{"role": "user", "content": "hi"}],
+                "related_memories": [{"id": "m1"}],
+                "entities": ["e1"],
+                "total_messages": 1,
+                "total_tokens": 0,
+            },
+        )
+    ])
+    client = _client(session)
+    result = asyncio.run(client.get_thread("t1", offset=0, limit=2))
+    assert set(result) == {"thread", "messages", "total_messages"}
+    assert "related_memories" not in result
+    assert "entities" not in result
+    assert "total_tokens" not in result
+
+
+def test_working_memory_uses_get_and_space() -> None:
+    session = FakeSession([
+        FakeResponse(
+            200,
+            {"rendered_markdown": "# WM", "file_path": "/srv/secret/wm.md"},
+        )
+    ])
+    client = _client(session)
+    result = asyncio.run(client.working_memory(space_id="space"))
+    assert result["rendered_markdown"] == "# WM"
+    assert "file_path" not in result
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "http://127.0.0.1:14242/agent/working-memory"
+    assert call["kwargs"]["params"] == {"space_id": "space"}
+
+
+def test_evolves_passes_memory_id_and_limit() -> None:
+    session = FakeSession([FakeResponse(200, {"edges": [], "total": 0})])
+    client = _client(session)
+    result = asyncio.run(client.evolves("m1", limit=5))
+    assert result["total"] == 0
+    call = session.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "http://127.0.0.1:14242/agent/evolves"
+    assert call["kwargs"]["params"] == {"memory_id": "m1", "limit": 5}
+
+
+def test_search_posts_recorded_date_window() -> None:
+    session = FakeSession([FakeResponse(200, [])])
+    client = _client(session)
+    asyncio.run(
+        client.search(
+            "hello",
+            limit=3,
+            space_id="space",
+            recorded_date_from="2026-11-01",
+            recorded_date_to="2026-11-30",
+        )
+    )
+    assert session.calls[0]["kwargs"]["json"] == {
+        "query": "hello",
+        "limit": 3,
+        "mode": "normal",
+        "space_id": "space",
+        "recorded_date_from": "2026-11-01",
+        "recorded_date_to": "2026-11-30",
+    }
+
+
+def test_search_omits_empty_recorded_date_window() -> None:
+    session = FakeSession([FakeResponse(200, [])])
+    client = _client(session)
+    asyncio.run(client.search("hello", limit=3, space_id="space"))
+    body = session.calls[0]["kwargs"]["json"]
+    for key in ("recorded_date_from", "recorded_date_to"):
+        assert key not in body
