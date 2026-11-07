@@ -1,4 +1,4 @@
-"""三个 llm_tool 的参数校验、两种搜索形态、上下界、写权限、状态与失败路径。"""
+"""七个 llm_tool 的参数校验、两种搜索形态、上下界、写权限、状态与失败路径。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import hashlib
 
 from core.client import NmemError
 from core.tools import (
+    MAX_GET_CHARS,
     MAX_LABEL_CHARS,
     MAX_PREVIEW_CHARS,
     MAX_SAVE_CHARS,
@@ -647,6 +648,20 @@ def test_get_memory_falls_back_to_label_ids_and_empty_metadata() -> None:
     assert "labels: label_a" in result
     assert "metadata: {}" in result
     assert "content:\n(空)" in result
+
+
+def test_get_memory_truncates_long_output_with_note() -> None:
+    client = FakeToolClient(
+        get_memory_result={
+            "id": "m1",
+            "title": "长文",
+            "content": "x" * (MAX_GET_CHARS + 500),
+        }
+    )
+    result = asyncio.run(_tools(client).get_memory("m1"))
+    body, _, note = result.partition("\nnote: ")
+    assert len(body) == MAX_GET_CHARS
+    assert note == f"输出超过 {MAX_GET_CHARS} 字符，已截断"
 
 
 def test_get_memory_rejects_empty_id() -> None:

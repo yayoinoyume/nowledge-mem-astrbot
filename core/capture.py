@@ -127,9 +127,10 @@ class CaptureCoordinator:
             return
         thread_id = snapshot.get("thread_id")
         if not isinstance(thread_id, str) or not thread_id:
-            thread_id = thread_id_for(
-                umo, self._space_id, self._agent_id, self._api_url, self._api_key_digest
-            )
+            # 缺 thread_id 的 pending 既不能路由也不能重放；只跳过会让它永久占位。
+            await self._store.clear_pending(umo)
+            self._logger.warning("丢弃 Nowledge Mem pending：缺少 thread_id")
+            return
         async with self._thread_lock(thread_id):
             pending = await self._store.get_pending(umo)
             if not isinstance(pending, dict):

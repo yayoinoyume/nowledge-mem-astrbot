@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from .client import NmemError
 
 MAX_SAVE_CHARS = 8000
+MAX_GET_CHARS = 8000
 MAX_PREVIEW_CHARS = 300
 MAX_TITLE_CHARS = 200
 MAX_LABEL_CHARS = 64
@@ -313,7 +314,7 @@ def _format_thread(index: int, item: dict[str, Any]) -> list[str]:
 
 
 class NmemTools:
-    """三个 llm_tool 的纯逻辑实现；所有失败都转成可读字符串。"""
+    """七个 llm_tool 的纯逻辑实现；所有失败都转成可读字符串。"""
 
     def __init__(
         self,
@@ -496,7 +497,13 @@ class NmemTools:
             if not text:
                 return "error: memory_id 不能为空"
             data = await self._client.get_memory(text, space_id=self._space_id)
-            return _format_memory_detail(data)
+            detail = _format_memory_detail(data)
+            if len(detail) > MAX_GET_CHARS:
+                return (
+                    detail[:MAX_GET_CHARS]
+                    + f"\nnote: 输出超过 {MAX_GET_CHARS} 字符，已截断"
+                )
+            return detail
         except NmemError as exc:
             return f"error: Nowledge Mem 读取记忆失败：{exc}"
         except Exception as exc:

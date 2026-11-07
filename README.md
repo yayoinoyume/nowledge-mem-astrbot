@@ -45,7 +45,7 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 | `save_admin_only` | bool | `false` | 仅管理员可调用 `nowledge_mem_save`；默认 member 也能写共享 space |
 | `enable_bundle` | bool | `true` | 是否注入 Context Bundle |
 | `bundle_every_turn` | bool | `true` | 每轮注入 Bundle |
-| `bundle_on_change` | bool | `false` | 仅在 Bundle 变化时注入（仅 `bundle_every_turn=false` 生效） |
+| `bundle_on_change` | bool | `false` | 缓存过期后是否重新拉取 Bundle 并刷新缓存；不控制是否注入 |
 | `enable_recall` | bool | `true` | 每轮按当前消息召回记忆 |
 | `recall_limit` | int | `5` | 每轮最多注入的召回条数（1–10） |
 | `timeout_seconds` | int | `3` | 读取接口超时，秒（1–15） |
@@ -68,12 +68,14 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 
 - `on_llm_request`：每轮注入 Bundle 与召回，并顺带重试 pending。
 - `on_agent_done`：一轮结束后提取增量消息，交给后台串行导入。
-- `terminate`：取消后台任务并关闭 HTTP 会话。
+- `on_astrbot_loaded`：启动时加载离线 outbox 里的待同步批次。
+
+`terminate` 是插件生命周期回调，负责取消后台任务并关闭 HTTP 会话，不属于 `@filter` 钩子。
 
 ### Bundle 与召回
 
 - `bundle_every_turn=true`（默认）：每轮都注入，用临时 part，不写入会话历史。同一会话 60 秒内复用 KV 里的上次 Bundle 以减少 GET；超过 60 秒重新拉取，`compiled_hash` 变化时立即刷新缓存。
-- `bundle_on_change=true`：仅在 `bundle_every_turn=false` 时启用旧的 hash 门控行为。
+- `bundle_on_change=true`：只在 `bundle_every_turn=false` 时起作用——缓存超过 60 秒后重新 GET 并刷新缓存。两个开关都不控制是否注入，Bundle 始终每轮注入。
 - 注入文本带七条 guidance（313 字）：记忆是参考、主动保存、不存敏感信息、按需搜索、先说明再搜、Bundle 只是简报、不要引用包装；全文见 `core/inject.py` 的 `GUIDANCE`。
 - Bundle 失败回退链：GET `/context/bundle` → KV 缓存的最近一次 Bundle → 注入「记忆服务暂不可用，本轮无上下文」。不会静默空注入。
 

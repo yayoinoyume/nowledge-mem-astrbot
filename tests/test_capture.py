@@ -492,6 +492,29 @@ def test_retry_pending_kv_error_is_logged_not_raised() -> None:
     assert any("pending 重试异常" in item for item in messages)
 
 
+def test_pending_without_thread_id_is_cleared_on_retry() -> None:
+    store = FakeStore()
+    window = [{"role": "user", "content": "u"}]
+    store.data[store._key("pending", "umo")] = {
+        "mode": "reset",
+        "messages": window,
+        "expected_count": None,
+        "idempotency_key": None,
+        "attempts": 0,
+        "at": "x",
+        "window": window,
+        "title": "t",
+    }
+    client = FakeCaptureClient([])
+    logger, messages = recording_logger("pending-no-thread", level=20)
+    coordinator = make_coordinator(client, store, logger=logger)
+
+    asyncio.run(coordinator.retry_pending("umo"))
+    assert store.pending("umo") is None
+    assert client.calls == []
+    assert any("缺少 thread_id" in item for item in messages)
+
+
 def test_deduplicated_append_ack_advances_without_retry() -> None:
     store = FakeStore()
     client = FakeCaptureClient(
