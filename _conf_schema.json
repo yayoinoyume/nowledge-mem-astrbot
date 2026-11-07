@@ -28,7 +28,7 @@
     "default": "astrbot"
   },
   "save_admin_only": {
-    "description": "仅管理员可保存记忆",
+    "description": "仅管理员可保存/更新记忆",
     "type": "bool",
     "default": false,
     "hint": "默认 false：member 也能写共享 space，脏数据会进入所有人的 Bundle/召回；需要闸门时设为 true"
@@ -74,7 +74,7 @@
       "max": 30,
       "step": 1
     },
-    "hint": "只影响 /mem_sum；轮数越多越可能超出模型上下文"
+    "hint": "只影响 /mem_sum；提示词超过 7000 字符预算时丢弃最老的消息"
   },
   "timeout_seconds": {
     "description": "读取接口超时（秒）",

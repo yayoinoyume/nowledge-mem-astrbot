@@ -138,6 +138,30 @@ def test_bundle_every_turn_injects_from_session_cache() -> None:
     assert sum("复用会话级 Bundle 缓存并注入" in item for item in messages) == 2
 
 
+def test_bundle_logs_report_wrapped_text_length() -> None:
+    store = FakeStore()
+    markdown = "# H"
+    client = FakeNmemClient(bundle={"rendered_markdown": markdown, "compiled_hash": "h1"})
+    logger, messages = recording_logger("bundle-length", level=20)
+    injector = _injector(client, enable_recall=False, logger=logger, store=store)
+
+    async def scenario():
+        first = await injector.collect("umo", "hello")
+        second = await injector.collect("umo", "hello")
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    injected = len(build_bundle_text(markdown))
+    assert injected > len(markdown)
+    for marker, texts in (
+        ("已注入 Nowledge Mem Context Bundle", first),
+        ("复用会话级 Bundle 缓存并注入", second),
+    ):
+        message = next(item for item in messages if marker in item)
+        assert f"（{len(texts[0])} 字符" in message
+        assert f"（{injected} 字符" in message
+
+
 def test_bundle_cache_expires_after_ttl() -> None:
     store = FakeStore()
     client = FakeNmemClient(bundle={"rendered_markdown": "# H", "compiled_hash": "h1"})

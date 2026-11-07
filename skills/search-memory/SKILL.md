@@ -30,7 +30,7 @@ description: 在 Nowledge Mem 中定向搜索记忆与历史对话，用于续�
 - `query`：3-7 个核心词，具体优于宽泛
 - `limit`：1-20，默认 10；先用小值
 - `mode`：默认 `normal`；结果弱或问题偏概念时用一次 `deep`，它更慢
-- `recorded_date_from` / `recorded_date_to`：按写入 Mem 的时间筛选，格式 `YYYY-MM-DD` 或 ISO 日期；事件时间不可用
+- `recorded_date_from` / `recorded_date_to`：按写入 Mem 的时间筛选，格式 `YYYY-MM-DD` 或 ISO 日期。当前工具只支持按写入时间筛选，服务端的事件时间字段尚未接入：问「事情发生在什么时候」时要说明这一点，不要假装能按事件时间过滤。
 
 ## 怎么读结果
 - 每条含 `id`、`title`、`content` 摘要、`score`；记忆若来自对话会带 `source_thread`

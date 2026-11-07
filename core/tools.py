@@ -100,17 +100,17 @@ def _search_timeout(mode: str, base: float) -> float:
 
 
 def _number(value: Any, default: float = 0.0) -> float:
-    """非有限值（nan/inf）回落默认值，避免把非法数字发出去。"""
+    """非有限值（nan/inf）与超范围数字回落默认值，避免把非法数字发出去。"""
     if isinstance(value, bool):
         return default
-    if isinstance(value, (int, float)):
-        number = float(value)
-    elif isinstance(value, str):
-        try:
+    try:
+        if isinstance(value, (int, float)):
+            number = float(value)
+        elif isinstance(value, str):
             number = float(value.strip())
-        except ValueError:
+        else:
             return default
-    else:
+    except (TypeError, ValueError, OverflowError):
         return default
     return number if math.isfinite(number) else default
 
@@ -121,7 +121,7 @@ def _importance(value: Any) -> float | None:
         return None
     try:
         score = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(score) or not 0.0 <= score <= 1.0:
         return None
@@ -240,7 +240,8 @@ def _format_memory_detail(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _labels(value: Any) -> list[str]:
+def _labels(value: Any) -> tuple[list[str], bool]:
+    """归一化标签；返回 (标签列表, 是否有标签被截断)。"""
     if isinstance(value, str):
         raw = [value]
     elif isinstance(value, list):
@@ -248,26 +249,32 @@ def _labels(value: Any) -> list[str]:
     else:
         raw = []
     labels: list[str] = []
+    truncated = False
     for item in raw:
-        label = _clip(item, MAX_LABEL_CHARS)
+        text = _text(item)
+        if len(text) > MAX_LABEL_CHARS:
+            truncated = True
+        label = text[:MAX_LABEL_CHARS]
         if label and label not in labels:
             labels.append(label)
         if len(labels) >= MAX_LABELS:
             break
-    return labels
+    return labels, truncated
 
 
 def _update_unconfirmed(data: dict[str, Any], name: str, expected: Any) -> bool:
-    """PATCH 回读校验：服务端没回显或回显值不一致都算未确认。
+    """PATCH 回读校验：服务端没回显，或空白归一后仍不一致都算未确认。
 
-    只覆盖可按值核对的字段；labels 服务端只回 label_ids，由 update 单独处理。
+    服务端可能把换行压成空格、把 CRLF 归一，比较前两侧都按空白归一，
+    避免实际写入成功却误报。只覆盖可按值核对的字段；labels 服务端只回
+    label_ids，由 update 单独处理。
     """
     if name == "importance":
         return abs(_number(data.get("importance"), -1.0) - float(expected)) > 1e-6
     returned = data.get(name)
     if returned is None:
         return True
-    return str(returned).strip() != str(expected).strip()
+    return _text(returned) != _text(expected)
 
 
 def _dedupe(items: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
@@ -467,10 +474,10 @@ class NmemTools:
             text = str(content or "").strip()
             if not text:
                 return "error: content 不能为空"
-            truncated = len(text) > MAX_SAVE_CHARS
-            if truncated:
+            content_truncated = len(text) > MAX_SAVE_CHARS
+            if content_truncated:
                 text = text[:MAX_SAVE_CHARS]
-            unit = str(unit_type or "fact").strip()
+            unit = str(unit_type or "fact").strip().lower()
             if unit not in VALID_UNIT_TYPES:
                 return (
                     "error: unit_type 必须是 fact、preference、decision、plan、"
@@ -478,12 +485,14 @@ class NmemTools:
                 )
             score = _number(importance, 0.6)
             score = max(0.0, min(1.0, score))
+            field_truncated = len(_text(title)) > MAX_TITLE_CHARS
+            normalized_labels, labels_truncated = _labels(labels)
             result = await self._client.save_memory(
                 text,
                 title=_clip(title, MAX_TITLE_CHARS),
                 unit_type=unit,
                 importance=score,
-                labels=_labels(labels),
+                labels=normalized_labels,
                 space_id=self._space_id,
                 agent_id=self._agent_id,
                 source_app=self._source_app,
@@ -504,11 +513,11 @@ class NmemTools:
             saved_title = _preview(
                 result.get("title") or memory.get("title") or title, MAX_TITLE_CHARS
             ) or "(无标题)"
-            note = (
-                f"\nnote: 内容超过 {MAX_SAVE_CHARS} 字符，已截断后保存"
-                if truncated
-                else ""
-            )
+            note = ""
+            if content_truncated:
+                note += f"\nnote: 内容超过 {MAX_SAVE_CHARS} 字符，已截断后保存"
+            if field_truncated or labels_truncated:
+                note += "\nnote: 标题或标签超长已截断"
             return (
                 f"saved: id={memory_id} title={saved_title} unit_type={unit} "
                 f"importance={score:.2f}{note}"
@@ -563,7 +572,7 @@ class NmemTools:
                 if score is None:
                     return "error: importance 必须是 0 到 1 之间的数字"
                 body["importance"] = score
-            normalized_labels = _labels(labels)
+            normalized_labels, _ = _labels(labels)
             if normalized_labels:
                 body["labels"] = normalized_labels
             if not body:

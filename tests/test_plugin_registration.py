@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+from operator import attrgetter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -174,6 +175,25 @@ def test_all_commands_are_registered() -> None:
             if isinstance(event_filter, CommandFilter):
                 names.add(event_filter.command_name)
     assert EXPECTED_COMMANDS <= names
+
+
+@pytest.mark.parametrize(
+    ("config", "path", "expected"),
+    [
+        ({"timeout_seconds": float("inf")}, "_timeout", 3),
+        (
+            {"mem_sum_rounds": float("inf")},
+            "_mem_sum_rounds",
+            plugin_main.MEM_SUM_ROUNDS_DEFAULT,
+        ),
+        ({"recall_limit": float("inf")}, "_injector._recall_limit", 5),
+    ],
+)
+def test_plugin_loading_survives_infinite_config_numbers(
+    config: dict, path: str, expected: int
+) -> None:
+    plugin = plugin_main.NowledgeMemPlugin(SimpleNamespace(), config)
+    assert attrgetter(path)(plugin) == expected
 
 
 def test_greedy_commands_accept_empty_and_join_remaining_words() -> None:
@@ -702,6 +722,62 @@ def test_mem_sum_command_strips_json_fence() -> None:
     assert outputs[0].startswith("distilled: 保存 1/1 条记忆")
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(
+            json.dumps(DISTILLED[:1], ensure_ascii=False) + "\n以上是结果。",
+            id="trailing-prose",
+        ),
+        pytest.param(
+            "以下是提炼结果：\n" + json.dumps(DISTILLED[:1], ensure_ascii=False),
+            id="leading-prose",
+        ),
+        pytest.param(
+            "\x60\x60\x60json\n"
+            + json.dumps(DISTILLED[:1], ensure_ascii=False)
+            + "\n\x60\x60\x60\n以上是结果。",
+            id="fenced-with-trailing-prose",
+        ),
+    ],
+)
+def test_mem_sum_command_parses_array_surrounded_by_prose(raw: str) -> None:
+    tools = _CommandTools()
+    stub = _mem_sum_stub(tools, _FakeProvider(raw))
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs[0].startswith("distilled: 保存 1/1 条记忆")
+    assert len(tools.save_calls) == 1
+
+
+def test_mem_sum_command_keeps_brackets_inside_strings() -> None:
+    entry = dict(
+        DISTILLED[0],
+        content='方括号 ] 与引号 " 都在字符串里 [1]',
+        title="带括号的标题",
+    )
+    raw = "说明：\n" + json.dumps([entry], ensure_ascii=False) + "\n结束"
+    tools = _CommandTools()
+    stub = _mem_sum_stub(tools, _FakeProvider(raw))
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs[0].startswith("distilled: 保存 1/1 条记忆")
+    assert tools.save_calls[0]["content"] == entry["content"]
+
+
+def test_mem_sum_command_rejects_unterminated_array() -> None:
+    raw = "\x60\x60\x60json\n" + '[{"content": "缺右括号", "unit_type": "fact"}'
+    tools = _CommandTools()
+    stub = _mem_sum_stub(tools, _FakeProvider(raw))
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs == ["error: 提炼结果不是合法 JSON"]
+    assert tools.save_calls == []
+
+
 def test_mem_sum_command_invalid_json() -> None:
     tools = _CommandTools()
     provider = _FakeProvider("这不是 JSON")
@@ -746,6 +822,40 @@ def test_mem_sum_command_drops_invalid_items() -> None:
     assert len(tools.save_calls) == 1
 
 
+def test_distill_items_drops_only_the_overflowing_importance() -> None:
+    raw = json.dumps(
+        [
+            {"content": "合法条目", "unit_type": "fact", "importance": 0.5},
+            {"content": "超大重要度", "unit_type": "fact", "importance": 10**400},
+        ],
+        ensure_ascii=False,
+    )
+    items, dropped = plugin_main._distill_items(raw)
+    assert [item["content"] for item in items] == ["合法条目"]
+    assert dropped == 1
+
+
+def test_mem_sum_command_keeps_valid_items_when_importance_overflows() -> None:
+    entries = [
+        DISTILLED[0],
+        {
+            "content": "超大重要度",
+            "title": "超大重要度",
+            "unit_type": "fact",
+            "importance": 10**400,
+        },
+    ]
+    tools = _CommandTools()
+    provider = _FakeProvider(json.dumps(entries, ensure_ascii=False))
+    stub = _mem_sum_stub(tools, provider)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs[0].startswith("distilled: 保存 1/1 条记忆")
+    assert "note: 丢弃 1 条（非法或超出上限）" in outputs[0]
+    assert len(tools.save_calls) == 1
+
+
 def test_mem_sum_command_reports_items_dropped_by_limit() -> None:
     entries = [
         {
@@ -787,6 +897,22 @@ def test_mem_sum_command_marks_failed_saves() -> None:
     )
     assert outputs[0].startswith("distilled: 保存 0/1 条记忆")
     assert "(保存失败)" in outputs[0]
+
+
+def test_mem_sum_command_marks_truncated_saves() -> None:
+    tools = _CommandTools(
+        save_result=(
+            "saved: id=m-new title=标题 unit_type=fact importance=0.60"
+            "\nnote: 标题或标签超长已截断"
+        )
+    )
+    provider = _FakeProvider(json.dumps(DISTILLED[:1], ensure_ascii=False))
+    stub = _mem_sum_stub(tools, provider)
+    outputs = _collect(
+        plugin_main.NowledgeMemPlugin.mem_sum(stub, _Event(admin=True))
+    )
+    assert outputs[0].startswith("distilled: 保存 1/1 条记忆")
+    assert "（已截断）" in outputs[0]
 
 
 class _HistoryManager:

@@ -181,11 +181,11 @@ class ContextInjector:
         if cached_markdown and (
             _cache_fresh(state, time.time()) or not refresh_enabled
         ):
+            text = build_bundle_text(cached_markdown)
             self._logger.info(
-                "复用会话级 Bundle 缓存并注入（%s 字符，含 guidance）",
-                len(cached_markdown),
+                "复用会话级 Bundle 缓存并注入（%s 字符，含 guidance）", len(text)
             )
-            return build_bundle_text(cached_markdown)
+            return text
         try:
             bundle = await self._client.context_bundle(
                 agent_id=self._agent_id,
@@ -210,11 +210,12 @@ class ContextInjector:
             )
             if previous_hash and previous_hash != compiled:
                 self._logger.debug("Context Bundle compiled_hash 变化，已刷新缓存")
+            text = build_bundle_text(markdown)
             self._logger.info(
                 "已注入 Nowledge Mem Context Bundle（%s 字符，含 guidance）",
-                len(markdown),
+                len(text),
             )
-            return build_bundle_text(markdown)
+            return text
         if bundle is None:
             if not self._fail_open:
                 raise NmemError("Context Bundle 响应为空")

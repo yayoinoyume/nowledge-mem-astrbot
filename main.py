@@ -56,7 +56,7 @@ def _value(config: Any, key: str, default: Any) -> Any:
 def _clamp(value: Any, low: int, high: int, default: int) -> int:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return max(low, min(high, number))
 
@@ -96,15 +96,37 @@ def _completion_text(resp: Any) -> str:
     return str(resp or "")
 
 
-def _strip_json_fence(text: str) -> str:
-    """模型常把 JSON 包在 ```json 围栏里，先剥掉首尾围栏。"""
-    body = str(text or "").strip()
-    if not body.startswith("```"):
-        return body
-    newline = body.find("\n")
-    body = body[newline + 1 :] if newline != -1 else body[3:]
-    if body.rstrip().endswith("```"):
-        body = body.rstrip()[:-3]
+def _extract_json_array(text: str) -> str:
+    """从模型输出里取出第一个 JSON 数组，容忍围栏与前后解释文字。
+
+    从第一个 '[' 开始做括号配对，字符串里的括号与转义不算结构；找不到配对的
+    ']' 时原样返回，交给 json.loads 报错。
+    """
+    body = str(text or "")
+    start = body.find("[")
+    if start == -1:
+        return body.strip()
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(body)):
+        char = body[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return body[start : index + 1]
     return body.strip()
 
 
@@ -114,7 +136,7 @@ def _distill_importance(value: Any) -> float | None:
         return 0.6
     try:
         score = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     # nan / inf 也过不了这个区间判断，直接按非法处理。
     if not 0.0 <= score <= 1.0:
@@ -147,7 +169,7 @@ def _distill_item(entry: Any) -> dict[str, Any] | None:
 
 def _distill_items(raw: str) -> tuple[list[dict[str, Any]], int]:
     """解析模型输出，返回 (合法条目, 丢弃条数)；JSON 非法时抛 ValueError。"""
-    data = json.loads(_strip_json_fence(raw))
+    data = json.loads(_extract_json_array(raw))
     if not isinstance(data, list):
         raise ValueError("提炼结果不是 JSON 数组")
     items: list[dict[str, Any]] = []
@@ -698,6 +720,8 @@ class NowledgeMemPlugin(Star):
                 line = f"- [{item['unit_type']}] {title} ({item['importance']:.2f})"
                 if result.startswith("saved:"):
                     saved += 1
+                    if "已截断" in result:
+                        line += "（已截断）"
                 else:
                     line += " (保存失败)"
                 lines.append(line)

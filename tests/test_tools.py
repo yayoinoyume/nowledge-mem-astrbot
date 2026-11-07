@@ -385,6 +385,14 @@ def test_save_rejects_invalid_unit_type() -> None:
     assert result.startswith("error: unit_type 必须是")
 
 
+def test_save_normalizes_unit_type_case() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).save("内容", unit_type="Fact"))
+    assert result.startswith("saved: id=m-new")
+    assert "unit_type=fact" in result
+    assert client.save_calls[0]["unit_type"] == "fact"
+
+
 def test_save_truncates_long_content_and_warns() -> None:
     client = FakeToolClient()
     result = asyncio.run(_tools(client).save("x" * (MAX_SAVE_CHARS + 1)))
@@ -400,6 +408,13 @@ def test_save_clamps_importance() -> None:
     assert client.save_calls[0]["importance"] == 1.0
     assert client.save_calls[1]["importance"] == 0.0
     assert client.save_calls[2]["importance"] == 0.4
+
+
+def test_save_falls_back_to_default_when_importance_overflows() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).save("内容", importance=10**400))
+    assert result.startswith("saved: id=m-new")
+    assert client.save_calls[0]["importance"] == 0.6
 
 
 def test_save_http_error_is_reported() -> None:
@@ -482,6 +497,13 @@ def test_update_rejects_non_finite_importance() -> None:
         assert client.update_calls == []
 
 
+def test_update_rejects_overflowing_importance() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).update("m1", importance=10**400))
+    assert result == "error: importance 必须是 0 到 1 之间的数字"
+    assert client.update_calls == []
+
+
 def test_update_rejects_out_of_range_importance() -> None:
     for value in (1.8, -0.2):
         client = FakeToolClient()
@@ -558,6 +580,18 @@ def test_update_importance_readback_tolerance() -> None:
     changed = FakeToolClient(update_result={"id": "m1", "importance": 0.5})
     result = asyncio.run(_tools(changed).update("m1", importance=0.8))
     assert "warn: 服务端未确认字段 importance" in result
+
+
+def test_update_accepts_server_whitespace_normalization() -> None:
+    client = FakeToolClient(update_result={"id": "m1", "content": "line1 line2 x"})
+    result = asyncio.run(_tools(client).update("m1", content="line1\n\nline2   x"))
+    assert result == "updated: id=m1 fields=content"
+
+
+def test_update_warns_when_normalized_content_still_differs() -> None:
+    client = FakeToolClient(update_result={"id": "m1", "content": "line1"})
+    result = asyncio.run(_tools(client).update("m1", content="line1\n\nline2   x"))
+    assert "warn: 服务端未确认字段 content" in result
 
 
 def test_update_http_error_is_reported() -> None:
@@ -666,6 +700,25 @@ def test_save_clips_title_and_labels_before_sending() -> None:
     call = client.save_calls[0]
     assert len(call["title"]) == MAX_TITLE_CHARS
     assert [len(label) for label in call["labels"]] == [MAX_LABEL_CHARS, 2]
+
+
+def test_save_notes_title_or_label_truncation_once() -> None:
+    payloads = (
+        {"title": "t" * (MAX_TITLE_CHARS + 100)},
+        {"labels": ["l" * (MAX_LABEL_CHARS + 36)]},
+        {
+            "title": "t" * (MAX_TITLE_CHARS + 100),
+            "labels": ["l" * (MAX_LABEL_CHARS + 36)],
+        },
+    )
+    for payload in payloads:
+        client = FakeToolClient()
+        result = asyncio.run(_tools(client).save("内容", **payload))
+        assert result.count("note: 标题或标签超长已截断") == 1
+        if "title" in payload:
+            assert len(client.save_calls[0]["title"]) == MAX_TITLE_CHARS
+        if "labels" in payload:
+            assert len(client.save_calls[0]["labels"][0]) == MAX_LABEL_CHARS
 
 
 def test_save_returned_title_is_previewed() -> None:

@@ -11,7 +11,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | 每轮注入 Context Bundle | 默认每轮注入，使用临时 part，不写入会话历史 |
-| 每轮记忆召回 | 用当前用户消息调 `/memories/search`，按相似度截取前 N 条 |
+| 每轮记忆召回 | 用当前用户消息调 `/memories/search`，在当前 space 内按服务端相关性排序取前 `recall_limit` 条，不设阈值，不做本地重排 |
 | 增量回写 | 一轮结束后只把新增消息 append 到同一 thread |
 | append / reset | 前缀未变走 append；前缀变化或窗口缩水走整段 reset |
 | 失败重试 | 失败批次落到 pending，下一轮在后台按原 mode 重试 |
@@ -77,7 +77,7 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 
 - `bundle_every_turn=true`（默认）：每轮都注入，用临时 part，不写入会话历史。同一会话 60 秒内复用 KV 里的上次 Bundle 以减少 GET；超过 60 秒重新拉取，`compiled_hash` 变化时立即刷新缓存。
 - `bundle_on_change=true`：只在 `bundle_every_turn=false` 时起作用——缓存超过 60 秒后重新 GET 并刷新缓存。两个开关都不控制是否注入，Bundle 始终每轮注入。
-- 注入文本带八条 guidance（387 字）：记忆是参考、主动保存、不存敏感信息、按需搜索、先说明再搜、Bundle 只是简报、不要引用包装；全文见 `core/inject.py` 的 `GUIDANCE`。
+- 注入文本带八条 guidance（387 字）：记忆是参考、主动保存、同一件事的细化或纠正先 search 再 update、不存敏感信息、按需搜索、先说明再搜、Bundle 只是简报、不要引用包装；全文见 `core/inject.py` 的 `GUIDANCE`。
 - Bundle 失败回退链：GET `/context/bundle` → KV 缓存的最近一次 Bundle → 注入「记忆服务暂不可用，本轮无上下文」。不会静默空注入。
 
 ### 工具
@@ -168,7 +168,10 @@ key        = cursor:<identity>:<umo>
 - 并发锁是进程内的 `asyncio.Lock`，多进程共享同一插件 KV 时同一 thread 可能并发写入。
 - 一个会话对应一个 thread，跨会话不合并。
 - 每轮召回固定走 `mode=normal`，工具可显式传 `mode=deep`；不做 rerank。
-- 心跳等内部消息默认不过滤，需要显式配置 `heartbeat_markers`。
+- 助手回复 `<HEARTBEAT_SILENT>` 始终丢弃，与配置无关；用户消息只看是否匹配 `heartbeat_markers` 前缀，默认空列表表示不过滤用户消息。
+- `nowledge_mem_update` 的 `labels` 服务端当前忽略：客户端只返回一行 `note`，不保证标签落地。
+- `nowledge_mem_update` 走 `PATCH /memories/{id}`：服务端该端点不接受 `space_id`，也不返回记忆所属空间；只要拿到 `memory_id`，就能改到其他空间的记忆。客户端无法在更新前确认归属，只能依赖 API Key 在服务端的权限范围。
+- `/mem_sum` 每次调用消耗一次模型请求的 token；一次最多写入 8 条；提示词预算 7000 字符，超出时丢弃最老的消息；非法条目丢弃并在报告里计数。
 
 ## 测试
 
