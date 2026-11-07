@@ -10,6 +10,159 @@ import aiohttp
 
 _IMPORT_TIMEOUT = 15.0
 
+
+class NmemError(Exception):
+    """Nowledge Mem 请求失败；status 是 HTTP 状态码（如果拿得到）。"""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _as_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _as_float(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _first_score(*sources: Any) -> float:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("similarity_score", "relevance_score", "score", "confidence"):
+            if key in source:
+                return _as_float(source.get(key))
+    return 0.0
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        raw = [value]
+    elif isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        return []
+    labels: list[str] = []
+    for item in raw:
+        text = _as_text(item)
+        if text and text not in labels:
+            labels.append(text)
+    return labels
+
+
+def _thread_ref(value: Any) -> str:
+    if isinstance(value, dict):
+        return _as_text(value.get("id") or value.get("thread_id"))
+    return _as_text(value)
+
+
+def _source_thread(memory: dict[str, Any], entry: dict[str, Any]) -> str:
+    metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+    candidates = (
+        memory.get("source_thread"),
+        memory.get("source_thread_id"),
+        entry.get("source_thread"),
+        entry.get("source_thread_id"),
+        metadata.get("source_thread_id"),
+        metadata.get("source_thread"),
+    )
+    for candidate in candidates:
+        thread_id = _thread_ref(candidate)
+        if thread_id:
+            return thread_id
+    return ""
+
+
+def normalize_search_response(data: Any) -> list[dict[str, Any]]:
+    """把 GET 的 {memories:[...]} 与 POST 的裸数组统一成内部结构。"""
+    if isinstance(data, dict):
+        if "memories" in data:
+            raw = data.get("memories")
+        elif "results" in data:
+            raw = data.get("results")
+        else:
+            raise NmemError("记忆搜索响应缺少 memories 列表")
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list):
+            raise NmemError("记忆搜索响应 memories 不是列表")
+    elif isinstance(data, list):
+        raw = data
+    else:
+        raise NmemError("记忆搜索响应格式错误")
+
+    normalized: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        memory = entry.get("memory") if isinstance(entry.get("memory"), dict) else entry
+        item_id = _as_text(memory.get("id") or entry.get("id"))
+        title = _as_text(memory.get("title") or entry.get("title"))
+        content = _as_text(memory.get("content") or entry.get("content"))
+        if not item_id and not title and not content:
+            continue
+        normalized.append(
+            {
+                "id": item_id,
+                "title": title,
+                "content": content,
+                "score": _first_score(entry, memory),
+                "unit_type": _as_text(
+                    memory.get("unit_type") or entry.get("unit_type")
+                )
+                or "memory",
+                "importance": _as_float(
+                    memory.get("importance")
+                    if "importance" in memory
+                    else entry.get("importance")
+                ),
+                "labels": _string_list(
+                    memory.get("labels")
+                    or memory.get("label_ids")
+                    or entry.get("labels")
+                    or entry.get("label_ids")
+                ),
+                "source_thread": _source_thread(memory, entry),
+            }
+        )
+    if raw and not normalized:
+        raise NmemError("记忆搜索结果无法解析")
+    return normalized
+
+
+def normalize_threads_response(data: Any) -> dict[str, Any]:
+    """把 /threads/search 的裸数组、{threads:[]}、{results:[]} 统一成 {threads:[]}。
+
+    其他形状（含 {"error": ...}）一律抛错：调用方不能把错形状当成空结果。
+    """
+    if isinstance(data, list):
+        return {"threads": data}
+    if not isinstance(data, dict):
+        raise NmemError("thread 搜索响应格式错误")
+    for key in ("threads", "results"):
+        if key not in data:
+            continue
+        raw = data.get(key)
+        if raw is None:
+            # 服务端无结果时可能返回 {"threads": null}：视为空列表，不当作错误。
+            return {**data, "threads": []}
+        if not isinstance(raw, list):
+            raise NmemError(f"thread 搜索响应 {key} 不是列表")
+        return {**data, "threads": raw}
+    raise NmemError("thread 搜索响应缺少 threads 列表")
+
+
 class NmemClient:
     """带超时与 Bearer 认证的异步客户端。"""
 
@@ -44,6 +197,10 @@ class NmemClient:
     def configured(self) -> bool:
         return bool(self._api_url and self._api_key)
 
+    @property
+    def api_url(self) -> str:
+        return self._api_url
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
@@ -54,16 +211,17 @@ class NmemClient:
         if self._owns_session and self._session is not None and not self._session.closed:
             await self._session.close()
 
-    async def _request(
+    async def _request_strict(
         self,
         method: str,
         path: str,
         *,
         timeout: float,
         **kwargs: Any,
-    ) -> Any | None:
+    ) -> Any:
+        """发请求；任何失败都抛 NmemError，调用方无法把失败当成空结果。"""
         if not self.configured:
-            return None
+            raise NmemError("未配置 api_url 或 api_key")
         session = await self._get_session()
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -80,17 +238,30 @@ class NmemClient:
                 **kwargs,
             ) as response:
                 if response.status >= 400:
-                    self._logger.debug(
-                        "Nowledge Mem %s %s 返回 HTTP %s",
-                        method,
-                        path,
-                        response.status,
-                    )
-                    return None
-                return await response.json(content_type=None)
+                    raise NmemError(f"HTTP {response.status}", status=response.status)
+                try:
+                    return await response.json(content_type=None)
+                except ValueError as exc:
+                    raise NmemError("响应不是合法 JSON") from exc
+        except NmemError:
+            raise
         except (TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
+            raise NmemError(f"请求失败：{type(exc).__name__}") from exc
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: float,
+        **kwargs: Any,
+    ) -> Any | None:
+        """旧接口：失败返回 None，供导入等“失败可重试”的路径使用。"""
+        try:
+            return await self._request_strict(method, path, timeout=timeout, **kwargs)
+        except NmemError as exc:
             self._logger.debug(
-                "Nowledge Mem %s %s 请求失败：%s", method, path, type(exc).__name__
+                "Nowledge Mem %s %s 请求失败：%s", method, path, exc
             )
             return None
 
@@ -100,8 +271,8 @@ class NmemClient:
         agent_id: str,
         source_app: str,
         space_id: str,
-    ) -> dict[str, Any] | None:
-        data = await self._request(
+    ) -> dict[str, Any]:
+        data = await self._request_strict(
             "GET",
             "/context/bundle",
             timeout=self._timeout,
@@ -112,7 +283,9 @@ class NmemClient:
                 "include_working_memory": "true",
             },
         )
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            raise NmemError("Context Bundle 响应不是对象")
+        return data
 
     async def search(
         self,
@@ -120,18 +293,129 @@ class NmemClient:
         *,
         limit: int,
         space_id: str,
-        mode: str = "fast",
+        mode: str = "normal",
+        timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         body: dict[str, Any] = {"query": query, "limit": limit, "mode": mode}
         if space_id:
             body["space_id"] = space_id
-        data = await self._request(
+        data = await self._request_strict(
             "POST",
             "/memories/search",
+            timeout=self._timeout if timeout is None else timeout,
+            json=body,
+        )
+        return normalize_search_response(data)
+
+    async def search_threads(
+        self,
+        query: str,
+        *,
+        limit: int,
+        space_id: str = "",
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"query": query, "limit": limit}
+        if space_id:
+            params["space_id"] = space_id
+        data = await self._request_strict(
+            "GET",
+            "/threads/search",
+            timeout=self._timeout if timeout is None else timeout,
+            params=params,
+        )
+        return normalize_threads_response(data)
+
+    async def save_memory(
+        self,
+        content: str,
+        *,
+        title: str,
+        unit_type: str,
+        importance: float,
+        labels: list[str],
+        space_id: str,
+        agent_id: str,
+        source_app: str,
+        source_umo: str = "",
+        sender_hash: str = "",
+    ) -> dict[str, Any]:
+        # 服务端 MemoryCreateRequest 没有 source_umo / sender_hash / import_origin
+        # 这三个顶层字段：传了会 200 但被静默忽略（2026-11-07 实测，GET 查不到）。
+        # metadata 是自由对象，会原样落库并在 GET /memories/{id} 返回，所以溯源放这里。
+        metadata: dict[str, Any] = {"import_origin": source_app}
+        if source_umo:
+            metadata["source_umo"] = source_umo
+        if sender_hash:
+            metadata["sender_hash"] = sender_hash
+        body: dict[str, Any] = {
+            "content": content,
+            "importance": importance,
+            "unit_type": unit_type,
+            "source": source_app,
+            "source_app": source_app,
+            "metadata": metadata,
+        }
+        if title:
+            body["title"] = title
+        if labels:
+            body["labels"] = labels
+        if space_id:
+            body["space_id"] = space_id
+        if agent_id:
+            body["agent_id"] = agent_id
+        data = await self._request_strict(
+            "POST",
+            "/memories",
             timeout=self._timeout,
             json=body,
         )
-        return data if isinstance(data, list) else []
+        if not isinstance(data, dict):
+            raise NmemError("保存记忆响应不是对象")
+        return data
+
+    async def health_details(self) -> dict[str, Any]:
+        data = await self._request_strict(
+            "GET", "/health/details", timeout=min(self._timeout, 3.0)
+        )
+        if not isinstance(data, dict):
+            raise NmemError("健康检查响应不是对象")
+        return data
+
+    async def has_pending_reviews(self) -> bool | None:
+        data = await self._request_strict(
+            "GET",
+            "/agent/feed/events",
+            timeout=min(self._timeout, 3.0),
+            params={
+                "review_only": "true",
+                "unresolved_only": "true",
+                "last_n_days": 365,
+                "limit": 1,
+                "include_total": "false",
+            },
+        )
+        if isinstance(data, list):
+            return bool(data)
+        if isinstance(data, dict):
+            events = data.get("events")
+            if isinstance(events, list):
+                return bool(events)
+            total = data.get("total")
+            if isinstance(total, int):
+                return total > 0
+            pending = data.get("pending_reviews")
+            if isinstance(pending, int):
+                return pending > 0
+        return None
+
+    async def health(self) -> dict[str, Any]:
+        data = await self._request_strict(
+            "GET", "/health", timeout=min(self._timeout, 3.0)
+        )
+        if isinstance(data, dict):
+            return data
+        return {"status": str(data)}
 
     async def import_thread(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         data = await self._request(

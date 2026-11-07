@@ -420,6 +420,7 @@ class CaptureCoordinator:
                 "prefix_fingerprint": prefix_fingerprint(window, len(window)),
                 "remote_count": remote_count,
                 "title": title,
+                "synced_at": _now_iso(),
             },
         )
 

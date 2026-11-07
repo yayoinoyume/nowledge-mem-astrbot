@@ -18,7 +18,7 @@
     "default": "space"
   },
   "agent_id": {
-    "description": "Context Bundle 使用的 Agent ID",
+    "description": "Context Bundle 与工具使用的 Agent ID",
     "type": "string",
     "default": "astrbot"
   },
@@ -26,6 +26,12 @@
     "description": "写入 Mem 时标记的来源应用",
     "type": "string",
     "default": "astrbot"
+  },
+  "save_admin_only": {
+    "description": "仅管理员可保存记忆",
+    "type": "bool",
+    "default": false,
+    "hint": "默认 false：member 也能写共享 space，脏数据会进入所有人的 Bundle/召回；需要闸门时设为 true"
   },
   "enable_bundle": {
     "description": "注入 Context Bundle",
@@ -36,13 +42,13 @@
     "description": "每轮注入 Context Bundle",
     "type": "bool",
     "default": true,
-    "hint": "默认 true；不依赖 compiled_hash，每轮都贴临时 part"
+    "hint": "Bundle 始终每轮注入；true 时缓存过期（60 秒）后重新拉取"
   },
   "bundle_on_change": {
-    "description": "仅在 Bundle 变化时注入（旧行为）",
+    "description": "缓存过期后重新拉取 Bundle（不控制是否注入）",
     "type": "bool",
     "default": false,
-    "hint": "仅在 bundle_every_turn=false 时生效"
+    "hint": "bundle_every_turn=false 时仍允许过期刷新；两者都 false 时只读缓存（无缓存仍拉取一次）"
   },
   "enable_recall": {
     "description": "每轮按当前消息召回记忆",
@@ -68,6 +74,12 @@
       "max": 15,
       "step": 1
     }
+  },
+  "fail_open": {
+    "description": "记忆服务失败时是否注入降级文本",
+    "type": "bool",
+    "default": true,
+    "hint": "true：失败时注入「记忆服务暂不可用」等降级文本并继续；false：不再注入降级文本，异常记入 AstrBot 错误日志（hook 异常由平台捕获，不承诺中止回合）"
   },
   "enable_capture": {
     "description": "对话结束后同步增量消息到 Mem thread",

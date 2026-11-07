@@ -320,7 +320,7 @@ def test_source_and_source_id_filtering() -> None:
         source="plugin", source_id="x", capture_plugin_turns=True, exclude_source_ids=[]
     ) == (True, "")
     assert should_capture_turn(
-        source="other", source_id="heartbeat", capture_plugin_turns=True, exclude_source_ids=["heartbeat"]
+        source="other", source_id="astrbot_heartbeat", capture_plugin_turns=True, exclude_source_ids=["astrbot_heartbeat"]
     ) == (False, "excluded_source_id")
     assert should_capture_turn(
         source="other", source_id="ok", capture_plugin_turns=False, exclude_source_ids=[]

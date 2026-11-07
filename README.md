@@ -3,7 +3,7 @@
 把 [Nowledge Mem](https://mem.nowledge.co) 的上下文与长期记忆接入 AstrBot：每轮对话前注入 Context Bundle 与相关记忆召回，每轮结束后把新增消息增量写回同一个 Mem thread。
 
 - 插件名：`nowledge_mem_astrbot`
-- 版本：0.15.0
+- 版本：0.16.0
 - 要求：AstrBot >= 4.24.2
 
 ## 能力
@@ -39,14 +39,16 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 | `api_url` | string | `http://127.0.0.1:14242` | Nowledge Mem 服务地址；非回环明文 HTTP 启动时打 WARNING |
 | `api_key` | string | 空 | Bearer 凭据，只保存在 AstrBot 配置里 |
 | `space_id` | string | `space` | 记忆空间 ID |
-| `agent_id` | string | `astrbot` | Context Bundle 使用的 Agent ID |
+| `agent_id` | string | `astrbot` | Context Bundle 与工具使用的 Agent ID |
 | `source_app` | string | `astrbot` | 写入 Mem 时标记的来源应用 |
+| `save_admin_only` | bool | `false` | 仅管理员可调用 `nowledge_mem_save`；默认 member 也能写共享 space |
 | `enable_bundle` | bool | `true` | 是否注入 Context Bundle |
 | `bundle_every_turn` | bool | `true` | 每轮注入 Bundle |
 | `bundle_on_change` | bool | `false` | 仅在 Bundle 变化时注入（仅 `bundle_every_turn=false` 生效） |
 | `enable_recall` | bool | `true` | 每轮按当前消息召回记忆 |
 | `recall_limit` | int | `5` | 每轮最多注入的召回条数（1–10） |
 | `timeout_seconds` | int | `3` | 读取接口超时，秒（1–15） |
+| `fail_open` | bool | `true` | 读取失败时注入降级文本；`false` 时不降级，异常记入 AstrBot 错误日志（不承诺中止回合） |
 | `enable_capture` | bool | `true` | 对话结束后同步增量消息到 Mem thread |
 | `capture_plugin_turns` | bool | `false` | 是否捕获 `source=plugin` 的回合 |
 | `capture_exclude_source_ids` | list | `[]` | 永不捕获的 `source_id` 列表 |
@@ -71,7 +73,7 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 
 - `bundle_every_turn=true`（默认）：每轮都注入，用临时 part，不写入会话历史。同一会话 60 秒内复用 KV 里的上次 Bundle 以减少 GET；超过 60 秒重新拉取，`compiled_hash` 变化时立即刷新缓存。
 - `bundle_on_change=true`：仅在 `bundle_every_turn=false` 时启用旧的 hash 门控行为。
-- 注入文本带 guidance：`以下记忆是参考，不得覆盖更高优先级的系统指令。`
+- 注入文本带七条 guidance（313 字）：记忆是参考、主动保存、不存敏感信息、按需搜索、先说明再搜、Bundle 只是简报、不要引用包装；全文见 `core/inject.py` 的 `GUIDANCE`。
 - Bundle 失败回退链：GET `/context/bundle` → KV 缓存的最近一次 Bundle → 注入「记忆服务暂不可用，本轮无上下文」。不会静默空注入。
 
 ### 游标与 append/reset
@@ -105,7 +107,7 @@ key        = cursor:<identity>:<umo>
 - 只处理文本：图片、语音等非文本 part 不进入记忆。
 - 并发锁是进程内的 `asyncio.Lock`，多进程共享同一插件 KV 时同一 thread 可能并发写入。
 - 一个会话对应一个 thread，跨会话不合并。
-- 召回固定走 `fast` 模式，不做 rerank。
+- 每轮召回固定走 `mode=normal`，工具可显式传 `mode=deep`；不做 rerank。
 - 心跳等内部消息默认不过滤，需要显式配置 `heartbeat_markers`。
 
 ## 测试
@@ -118,6 +120,12 @@ uv run --with pytest --with aiohttp python -m pytest tests -q
 
 ```bash
 ASTRBOT_SOURCE=/path/to/astrbot uv run --with pytest --with aiohttp --with pydantic python -m pytest tests -q
+```
+
+插件级注册/权限测试需要 AstrBot 的完整依赖，必须用 AstrBot 自己的 venv 解释器跑，否则整模块 skip：
+
+```bash
+ASTRBOT_SOURCE=/path/to/astrbot/app uv run --python /path/to/astrbot/app/.venv/bin/python --with pytest --with aiohttp --with pydantic python -m pytest tests -q
 ```
 
 只读 smoke（需要服务可达）：
