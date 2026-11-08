@@ -66,6 +66,15 @@ def _clip(value: Any, limit: int) -> str:
     return _text(value)[:limit]
 
 
+def _error_text(exc: BaseException) -> str:
+    """把异常压成搜索提示里可读的一行。"""
+    if isinstance(exc, NmemError):
+        return _text(exc) or "NmemError"
+    detail = _text(exc)
+    name = type(exc).__name__
+    return f"{name}: {detail}" if detail else name
+
+
 def _sender_hash(sender_id: Any) -> str:
     """共享 space 里只留哈希，不存明文发送者 ID。"""
     text = str(sender_id or "").strip()
@@ -414,33 +423,67 @@ class NmemTools:
             ):
                 return "error: recorded_date_from 不能晚于 recorded_date_to"
             collected: list[tuple[str, dict[str, Any]]] = []
+            failures: list[str] = []
             if scope_text in ("memories", "both"):
-                memories = await self._client.search(
-                    text,
-                    limit=count,
-                    space_id=self._space_id,
-                    mode=mode_text,
-                    recorded_date_from=dates["recorded_date_from"],
-                    recorded_date_to=dates["recorded_date_to"],
-                    timeout=timeout,
-                )
-                collected.extend(("memory", item) for item in memories)
+                try:
+                    memories = await self._client.search(
+                        text,
+                        limit=count,
+                        space_id=self._space_id,
+                        mode=mode_text,
+                        recorded_date_from=dates["recorded_date_from"],
+                        recorded_date_to=dates["recorded_date_to"],
+                        timeout=timeout,
+                    )
+                    collected.extend(("memory", item) for item in memories)
+                except Exception as exc:
+                    if scope_text != "both":
+                        raise
+                    self._logger.warning(
+                        "nowledge_mem_search 记忆检索失败：%s",
+                        type(exc).__name__,
+                    )
+                    failures.append(f"记忆检索失败：{_error_text(exc)}")
             if scope_text in ("threads", "both"):
-                data = await self._client.search_threads(
-                    text,
-                    limit=count,
-                    space_id=self._space_id,
-                    timeout=timeout,
+                try:
+                    data = await self._client.search_threads(
+                        text,
+                        limit=count,
+                        space_id=self._space_id,
+                        timeout=timeout,
+                    )
+                    threads = (
+                        data.get("threads") if isinstance(data, dict) else None
+                    )
+                    if not isinstance(threads, list):
+                        if scope_text != "both":
+                            return "error: thread 搜索响应缺少 threads 列表"
+                        raise NmemError("thread 搜索响应缺少 threads 列表")
+                    collected.extend(("thread", item) for item in threads)
+                except Exception as exc:
+                    if scope_text != "both":
+                        raise
+                    self._logger.warning(
+                        "nowledge_mem_search 对话检索失败：%s",
+                        type(exc).__name__,
+                    )
+                    failures.append(f"对话检索失败：{_error_text(exc)}")
+            if len(failures) == 2:
+                return (
+                    "error: Nowledge Mem 搜索失败：" + "；".join(failures)
                 )
-                threads = data.get("threads") if isinstance(data, dict) else None
-                if not isinstance(threads, list):
-                    return "error: thread 搜索响应缺少 threads 列表"
-                collected.extend(("thread", item) for item in threads)
+            note = "".join(f"\nnote: {item}" for item in failures)
+            if (
+                dates["recorded_date_from"] or dates["recorded_date_to"]
+            ) and scope_text != "memories":
+                note += "\nnote: 日期过滤只对记忆生效，对话检索不支持按时间筛选"
             merged = _dedupe(collected)
             merged.sort(key=lambda pair: _score(pair[1]), reverse=True)
             merged = merged[:count]
             if not merged:
-                return f'no matches: query="{text}" scope={scope_text}'
+                return (
+                    f'no matches: query="{text}" scope={scope_text}' + note
+                )
             lines = [
                 f'matches: {len(merged)} (query="{text}", scope={scope_text})'
             ]
@@ -449,7 +492,7 @@ class NmemTools:
                     lines.extend(_format_memory(index, item))
                 else:
                     lines.extend(_format_thread(index, item))
-            return "\n".join(lines)
+            return "\n".join(lines) + note
         except NmemError as exc:
             return f"error: Nowledge Mem 搜索失败：{exc}"
         except Exception as exc:
@@ -572,10 +615,15 @@ class NmemTools:
                 if score is None:
                     return "error: importance 必须是 0 到 1 之间的数字"
                 body["importance"] = score
-            normalized_labels, _ = _labels(labels)
+            normalized_labels, labels_truncated = _labels(labels)
             if normalized_labels:
                 body["labels"] = normalized_labels
             if not body:
+                if isinstance(labels, list) and not labels:
+                    return (
+                        "error: labels 为空列表；服务端当前不支持清空标签，"
+                        "请至少提供其它字段"
+                    )
                 return (
                     "error: 至少提供 content、title、unit_type、importance 或 "
                     "labels 之一"
@@ -600,6 +648,8 @@ class NmemTools:
                 lines.append("note: 服务端当前忽略 labels 字段，本次标签变更未生效")
             if truncated:
                 lines.append("note: 内容或标题超长已截断")
+            if labels_truncated:
+                lines.append("note: 标签超长已截断")
             return "\n".join(lines)
         except NmemError as exc:
             return f"error: Nowledge Mem 更新失败：{exc}"

@@ -25,7 +25,7 @@ from .core.store import NmemStore
 from .core.tools import NmemTools, VALID_UNIT_TYPES
 
 _DEFAULT_API_URL = "http://127.0.0.1:14242"
-_PLUGIN_VERSION = "0.18.1"
+_PLUGIN_VERSION = "0.18.2"
 MEM_SUM_ROUNDS_DEFAULT = 10
 MAX_DISTILL_ITEMS = 8
 MAX_SUMMARY_MESSAGE_CHARS = 1000
@@ -597,7 +597,7 @@ class NowledgeMemPlugin(Star):
         if not selected_newest_first:
             return "", 0, 0, ""
         selected = list(reversed(selected_newest_first))
-        actual_rounds = (len(selected) + 1) // 2
+        actual_rounds = sum(1 for role, _ in selected if role == "user")
         lines = [
             f"{role}: {content[:MAX_SUMMARY_MESSAGE_CHARS]}"
             for role, content in selected

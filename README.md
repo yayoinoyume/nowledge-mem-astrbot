@@ -3,7 +3,7 @@
 把 [Nowledge Mem](https://mem.nowledge.co) 的上下文与长期记忆接入 AstrBot：每轮对话前注入 Context Bundle 与相关记忆召回，每轮结束后把新增消息增量写回同一个 Mem thread。
 
 - 插件名：`nowledge_mem_astrbot`
-- 版本：0.18.1
+- 版本：0.18.2
 - 要求：AstrBot >= 4.27.3
 
 ## 能力
@@ -11,7 +11,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | 每轮注入 Context Bundle | 默认每轮注入，使用临时 part，不写入会话历史 |
-| 每轮记忆召回 | 用当前用户消息调 `/memories/search`，在当前 space 内按服务端相关性排序取前 `recall_limit` 条，不设阈值，不做本地重排 |
+| 每轮记忆召回 | 用当前用户消息调 `/memories/search`，在当前 space 内按服务端返回顺序取前 `recall_limit` 条，不做本地重排与分数过滤；召回行带 id（`- id=... 标题：摘要`），压缩后短于 2 字的查询不召回 |
 | 增量回写 | 一轮结束后只把新增消息 append 到同一 thread |
 | append / reset | 前缀未变走 append；前缀变化或窗口缩水走整段 reset |
 | 失败重试 | 失败批次落到 pending，下一轮在后台按原 mode 重试 |
@@ -52,7 +52,7 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 | `bundle_every_turn` | bool | `true` | 每轮注入 Bundle |
 | `bundle_on_change` | bool | `false` | 缓存过期后是否重新拉取 Bundle 并刷新缓存；不控制是否注入 |
 | `enable_recall` | bool | `true` | 每轮按当前消息召回记忆 |
-| `recall_limit` | int | `5` | 每轮最多注入的召回条数（1–10） |
+| `recall_limit` | int | `5` | 每轮最多注入的召回条数（1–10）；按服务端返回顺序取，不做本地重排，也没有本地分数门槛 |
 | `mem_sum_rounds` | int | `10` | `/mem_sum` 取最近多少轮对话做蒸馏（3–30） |
 | `timeout_seconds` | int | `3` | 读取接口超时，秒（1–15） |
 | `fail_open` | bool | `true` | 读取失败时注入降级文本；`false` 时不降级，异常记入 AstrBot 错误日志（不承诺中止回合） |
@@ -82,16 +82,17 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 
 - `bundle_every_turn=true`（默认）：每轮都注入，用临时 part，不写入会话历史。同一会话 60 秒内复用 KV 里的上次 Bundle 以减少 GET；超过 60 秒重新拉取，`compiled_hash` 变化时立即刷新缓存。
 - `bundle_on_change=true`：只在 `bundle_every_turn=false` 时起作用——缓存超过 60 秒后重新 GET 并刷新缓存。两个开关都不控制是否注入，Bundle 始终每轮注入。
-- 注入文本带八条 guidance（387 字）：记忆是参考、主动保存、同一件事的细化或纠正先 search 再 update、不存敏感信息、按需搜索、先说明再搜、Bundle 只是简报、不要引用包装；全文见 `core/inject.py` 的 `GUIDANCE`。
+- 注入文本带十条 guidance（483 字）：记忆是参考、主动保存、同一件事的细化或纠正先 search 再 update、不存敏感信息、按需搜索、先说明再搜、Bundle 只是简报、不要引用包装、不能删除记忆要如实说明、对话记录的时间是导入时间；全文见 `core/inject.py` 的 `GUIDANCE`。
+- 召回：当前消息压缩空白后长度 2–500 才召回，短于 2 字直接跳过；按服务端返回顺序取前 `recall_limit` 条，不做本地重排，也没有本地分数门槛；每行 `- id=<id> 标题：摘要`（不显示分数），包装里另带一句 52 字免责说明（大意「可能与本题无关，相关才用」）。
 - Bundle 失败回退链：GET `/context/bundle` → KV 缓存的最近一次 Bundle → 注入「记忆服务暂不可用，本轮无上下文」。不会静默空注入。
 
 ### 工具
 
 | 工具 | 参数 | 说明 |
 | --- | --- | --- |
-| nowledge_mem_search | query、scope（memories/threads/both）、limit（1–20，默认 10）、mode（normal/deep）、recorded_date_from/to | 搜记忆或历史对话；空结果返回 no matches，请求失败返回 error:，两者不混淆 |
+| nowledge_mem_search | query、scope（memories/threads/both）、limit（1–20，默认 10）、mode（normal/deep）、recorded_date_from/to | 搜记忆或历史对话；空结果返回 no matches，请求失败返回 error:，两者不混淆。日期过滤只对 memories 生效：选 threads 时参数被忽略，选 both 时末尾追加 `note: 日期过滤只对记忆生效，对话检索不支持按时间筛选` |
 | nowledge_mem_save | content、title、unit_type、importance（0–1）、labels | 写入记忆；标题截 200 字、标签截 64 字；save_admin_only=true 时仅管理员可用 |
-| nowledge_mem_update | memory_id、content、title、unit_type、importance、labels | 改已有记忆，只提交给出的字段并回读校验；labels 服务端当前不生效，会返回一行 note；save_admin_only=true 时仅管理员可用 |
+| nowledge_mem_update | memory_id、content、title、unit_type、importance、labels | 改已有记忆，只提交给出的字段并回读校验；labels 服务端当前不生效，会返回一行 note；正文/标题或标签超长会截断并各给一行 note；只传 `labels=[]` 且没有其它字段时直接返回 error:（服务端不支持清空标签）；save_admin_only=true 时仅管理员可用 |
 | nowledge_mem_status | 无 | 连接、space、agent、identity、pending、last_sync、服务端版本；不输出 API Key |
 | nowledge_mem_get | memory_id | 读一条记忆全文、标题、类型、重要度、标签与 metadata；metadata 里的 file_path 递归剔除 |
 | nowledge_mem_thread_show | thread_id、offset（≥0，默认 0）、limit（1–100，默认 20） | 读历史对话消息；单条内容最多 500 字，丢弃 related_memories、entities、total_tokens |
@@ -177,6 +178,10 @@ key        = cursor:<identity>:<umo>
 - `nowledge_mem_update` 的 `labels` 服务端当前忽略：客户端只返回一行 `note`，不保证标签落地。
 - `nowledge_mem_update` 走 `PATCH /memories/{id}`：服务端该端点不接受 `space_id`，也不返回记忆所属空间；只要拿到 `memory_id`，就能改到其他空间的记忆。客户端无法在更新前确认归属，只能依赖 API Key 在服务端的权限范围。
 - `/mem_sum` 每次调用消耗一次模型请求的 token；一次最多写入 8 条；提示词预算 7000 字符，超出时丢弃最老的消息；非法条目丢弃并在报告里计数。
+- 召回不做本地过滤：按服务端返回顺序取前 `recall_limit` 条，没有分数门槛，也没有本地重排；结果可能与本题无关，包装里带 52 字免责说明提示模型相关才用。
+- `recorded_date_from` / `recorded_date_to` 只对 `memories` 生效：`scope=threads` 忽略该参数，`scope=both` 在结果末尾追加 note；对话检索不支持按时间筛选。
+- 对话记录的时间是导入时间，不是发言时间：不能用来回答「什么时候聊的」。
+- 插件没有删除记忆的能力：工具集里没有删除接口，guidance 要求模型如实说明「当前没有这个能力，请到 Nowledge Mem 里操作」，不得假装已删除。
 
 ## 测试
 

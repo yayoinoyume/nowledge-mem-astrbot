@@ -154,7 +154,7 @@ def _plugin(*, save_admin_only: bool = False):
             agent_id="astrbot",
             source_app="astrbot",
             identity="identity123",
-            plugin_version="0.18.1",
+            plugin_version="0.18.2",
             save_admin_only=save_admin_only,
             timeout_seconds=3,
         )
@@ -996,5 +996,24 @@ def test_recent_history_keeps_newest_messages_when_over_budget() -> None:
     last = int(lines[-1].split("message-", 1)[1].split()[0])
     assert first < last
     assert len(text.splitlines()) - 1 == count
-    assert rounds == (count + 1) // 2
+    assert rounds == sum(1 for line in lines if line.startswith("user:"))
     assert text.splitlines()[0] == f"会话总结（最近 {rounds} 轮）"
+
+
+def test_recent_history_counts_rounds_by_user_messages() -> None:
+    history = [
+        {"role": "user", "content": "第一条"},
+        {"role": "user", "content": "第二条"},
+    ]
+    context = SimpleNamespace(conversation_manager=_HistoryManager(history))
+    stub = SimpleNamespace(context=context)
+
+    text, count, rounds, _title = asyncio.run(
+        plugin_main.NowledgeMemPlugin._recent_history_text(
+            stub, "qq:group:1", 10
+        )
+    )
+
+    assert count == 2
+    assert rounds == 2
+    assert text.splitlines()[0] == "会话总结（最近 2 轮）"

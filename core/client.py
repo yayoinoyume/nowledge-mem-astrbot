@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 from urllib.parse import quote, urlparse
 
 import aiohttp
 
 _IMPORT_TIMEOUT = 15.0
+_WRITE_TIMEOUT_MIN = 5.0
+_WRITE_TIMEOUT_MAX = 15.0
+_ERROR_DETAIL_CHARS = 200
 
 
 class NmemError(Exception):
@@ -21,6 +26,43 @@ class NmemError(Exception):
 
 def _as_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+_DETAIL_KEYS = ("detail", "message", "error", "error_description")
+
+
+def _redact(text: str) -> str:
+    """去掉可能是凭据或内部路径的片段：长串 token、Bearer 值、绝对路径。"""
+    cleaned = re.sub(r"(?i)bearer\s+[A-Za-z0-9._\-]+", "Bearer <redacted>", text)
+    cleaned = re.sub(r"\bnmem_[A-Za-z0-9._\-]{8,}", "<redacted-key>", cleaned)
+    cleaned = re.sub(r"\bsk-[A-Za-z0-9._\-]{8,}", "<redacted-key>", cleaned)
+    cleaned = re.sub(r"(/[A-Za-z0-9._\-]+){3,}", "<redacted-path>", cleaned)
+    return " ".join(cleaned.split())[:_ERROR_DETAIL_CHARS]
+
+
+async def _response_detail(response: Any) -> str:
+    """取错误响应里可安全展示的说明；非结构化响应一律不原文回显。
+
+    只接受 JSON 对象里的 detail/message/error 字段并做脱敏，避免把服务端
+    响应中的凭据、内部路径或调试信息带进模型上下文。
+    """
+    try:
+        body = await response.text()
+    except Exception:
+        return ""
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for key in _DETAIL_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return _redact(value)
+    return ""
 
 
 def _as_float(value: Any) -> float:
@@ -36,14 +78,14 @@ def _as_float(value: Any) -> float:
     return 0.0
 
 
-def _first_score(*sources: Any) -> float:
+def _first_score(*sources: Any) -> float | None:
     for source in sources:
         if not isinstance(source, dict):
             continue
         for key in ("similarity_score", "relevance_score", "score", "confidence"):
             if key in source:
                 return _as_float(source.get(key))
-    return 0.0
+    return None
 
 
 def _string_list(value: Any) -> list[str]:
@@ -112,30 +154,31 @@ def normalize_search_response(data: Any) -> list[dict[str, Any]]:
         content = _as_text(memory.get("content") or entry.get("content"))
         if not item_id and not title and not content:
             continue
-        normalized.append(
-            {
-                "id": item_id,
-                "title": title,
-                "content": content,
-                "score": _first_score(entry, memory),
-                "unit_type": _as_text(
-                    memory.get("unit_type") or entry.get("unit_type")
-                )
-                or "memory",
-                "importance": _as_float(
-                    memory.get("importance")
-                    if "importance" in memory
-                    else entry.get("importance")
-                ),
-                "labels": _string_list(
-                    memory.get("labels")
-                    or memory.get("label_ids")
-                    or entry.get("labels")
-                    or entry.get("label_ids")
-                ),
-                "source_thread": _source_thread(memory, entry),
-            }
-        )
+        item: dict[str, Any] = {
+            "id": item_id,
+            "title": title,
+            "content": content,
+            "unit_type": _as_text(
+                memory.get("unit_type") or entry.get("unit_type")
+            )
+            or "memory",
+            "importance": _as_float(
+                memory.get("importance")
+                if "importance" in memory
+                else entry.get("importance")
+            ),
+            "labels": _string_list(
+                memory.get("labels")
+                or memory.get("label_ids")
+                or entry.get("labels")
+                or entry.get("label_ids")
+            ),
+            "source_thread": _source_thread(memory, entry),
+        }
+        score = _first_score(entry, memory)
+        if score is not None:
+            item["score"] = score
+        normalized.append(item)
     if raw and not normalized:
         raise NmemError("记忆搜索结果无法解析")
     return normalized
@@ -201,6 +244,13 @@ class NmemClient:
     def api_url(self) -> str:
         return self._api_url
 
+    @property
+    def _write_timeout(self) -> float:
+        """写路径可能触发 embedding/去重：在读取超时上放大，但封顶 15 秒。"""
+        return min(
+            max(self._timeout * 2, _WRITE_TIMEOUT_MIN), _WRITE_TIMEOUT_MAX
+        )
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
@@ -238,7 +288,11 @@ class NmemClient:
                 **kwargs,
             ) as response:
                 if response.status >= 400:
-                    raise NmemError(f"HTTP {response.status}", status=response.status)
+                    detail = await _response_detail(response)
+                    message = f"HTTP {response.status}"
+                    if detail:
+                        message = f"{message}: {detail}"
+                    raise NmemError(message, status=response.status)
                 try:
                     return await response.json(content_type=None)
                 except ValueError as exc:
@@ -496,7 +550,7 @@ class NmemClient:
         data = await self._request_strict(
             "POST",
             "/memories",
-            timeout=self._timeout,
+            timeout=self._write_timeout,
             json=body,
         )
         if not isinstance(data, dict):
@@ -537,7 +591,7 @@ class NmemClient:
         data = await self._request_strict(
             "PATCH",
             f"/memories/{quote(memory_id, safe='')}",
-            timeout=self._timeout if timeout is None else timeout,
+            timeout=self._write_timeout if timeout is None else timeout,
             json=body,
         )
         if not isinstance(data, dict):

@@ -24,6 +24,7 @@ from .delta import (
 MAX_ATTEMPTS = 50
 MAX_PENDING_AGE_SECONDS = 24 * 60 * 60
 MAX_LOCKS = 256
+MAX_CONCURRENT_PENDING_RETRIES = 8
 
 
 def should_capture_turn(
@@ -72,6 +73,7 @@ class CaptureCoordinator:
         max_attempts: int = MAX_ATTEMPTS,
         max_pending_age: float = MAX_PENDING_AGE_SECONDS,
         max_locks: int = MAX_LOCKS,
+        max_concurrent_pending_retries: int = MAX_CONCURRENT_PENDING_RETRIES,
     ) -> None:
         self._client = client
         self._store = store
@@ -84,8 +86,10 @@ class CaptureCoordinator:
         self._max_attempts = max_attempts
         self._max_pending_age = max_pending_age
         self._max_locks = max_locks
+        self._max_concurrent_pending_retries = max_concurrent_pending_retries
         self._locks: dict[str, _LockEntry] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._pending_retry_tasks: dict[str, asyncio.Task] = {}
 
     def schedule(self, umo: str, messages: list[dict[str, str]]) -> None:
         if not messages:
@@ -96,12 +100,31 @@ class CaptureCoordinator:
         self._spawn(self.sync(umo, list(messages)))
 
     def schedule_pending_retry(self, umo: str) -> None:
-        self._spawn(self.retry_pending(umo))
+        if umo in self._pending_retry_tasks:
+            self._logger.debug("pending 重试已在执行，跳过重复调度：umo=%s", umo)
+            return
+        if len(self._pending_retry_tasks) >= self._max_concurrent_pending_retries:
+            self._logger.debug(
+                "pending 重试并发已达上限 %s，跳过本轮调度：umo=%s",
+                self._max_concurrent_pending_retries,
+                umo,
+            )
+            return
+        task = self._spawn(self.retry_pending(umo))
+        self._pending_retry_tasks[umo] = task
+        task.add_done_callback(
+            lambda done, key=umo: self._pending_retry_done(key, done)
+        )
 
-    def _spawn(self, coro: Any) -> None:
+    def _spawn(self, coro: Any) -> asyncio.Task:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        return task
+
+    def _pending_retry_done(self, umo: str, task: asyncio.Task) -> None:
+        if self._pending_retry_tasks.get(umo) is task:
+            del self._pending_retry_tasks[umo]
 
     async def wait(self) -> None:
         if self._tasks:
@@ -114,6 +137,7 @@ class CaptureCoordinator:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
+        self._pending_retry_tasks.clear()
 
     async def retry_pending(self, umo: str) -> None:
         try:

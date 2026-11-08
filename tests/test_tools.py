@@ -30,6 +30,7 @@ class FakeToolClient:
         health_result=None,
         health_details_result=None,
         search_error=None,
+        search_threads_error=None,
         save_error=None,
         update_error=None,
         health_error=None,
@@ -60,6 +61,7 @@ class FakeToolClient:
             "cli_version": "0.10.113",
         }
         self.search_error = search_error
+        self.search_threads_error = search_threads_error
         self.save_error = save_error
         self.update_error = update_error
         self.health_error = health_error
@@ -116,8 +118,8 @@ class FakeToolClient:
 
     async def search_threads(self, query, **kwargs):
         self.thread_calls.append({"query": query, **kwargs})
-        if self.search_error:
-            raise self.search_error
+        if self.search_threads_error:
+            raise self.search_threads_error
         if self.threads_response is not None:
             return self.threads_response
         return {"threads": list(self.threads), "total_found": len(self.threads)}
@@ -200,7 +202,7 @@ def _tools(
         agent_id="astrbot",
         source_app="astrbot",
         identity="identity123",
-        plugin_version="0.18.1",
+        plugin_version="0.18.2",
         save_admin_only=save_admin_only,
         timeout_seconds=timeout_seconds,
     )
@@ -293,6 +295,54 @@ def test_search_threads_formats_snippets() -> None:
     assert client.search_calls == []
 
 
+def test_search_threads_with_dates_appends_scope_note() -> None:
+    client = FakeToolClient(
+        threads=[{"thread_id": "t1", "title": "旧对话", "relevance_score": 0.7}]
+    )
+    result = asyncio.run(
+        _tools(client).search(
+            "查询", scope="threads", recorded_date_from="2026-01-01"
+        )
+    )
+    assert result.endswith(
+        "note: 日期过滤只对记忆生效，对话检索不支持按时间筛选"
+    )
+
+
+def test_search_both_with_dates_appends_scope_note() -> None:
+    client = FakeToolClient(
+        memories=[_memory()],
+        threads=[{"thread_id": "t1", "title": "对话", "relevance_score": 0.8}],
+    )
+    result = asyncio.run(
+        _tools(client).search(
+            "查询", scope="both", recorded_date_from="2026-01-01"
+        )
+    )
+    assert result.endswith(
+        "note: 日期过滤只对记忆生效，对话检索不支持按时间筛选"
+    )
+
+
+def test_search_memories_with_dates_has_no_scope_note() -> None:
+    client = FakeToolClient(memories=[_memory()])
+    result = asyncio.run(
+        _tools(client).search(
+            "查询", scope="memories", recorded_date_from="2026-01-01"
+        )
+    )
+    assert "日期过滤只对记忆生效" not in result
+    assert client.search_calls[0]["recorded_date_from"] == "2026-01-01"
+
+
+def test_search_without_dates_has_no_scope_note() -> None:
+    client = FakeToolClient(
+        threads=[{"thread_id": "t1", "title": "对话", "relevance_score": 0.8}]
+    )
+    result = asyncio.run(_tools(client).search("查询", scope="threads"))
+    assert "日期过滤只对记忆生效" not in result
+
+
 def test_search_both_merges_and_dedupes() -> None:
     memory = _memory(id="m1", title="记忆", content="内容", score=0.9)
     client = FakeToolClient(
@@ -340,6 +390,39 @@ def test_search_timeout_is_reported_not_empty() -> None:
     result = asyncio.run(_tools(client).search("查询"))
     assert result.startswith("error: Nowledge Mem 搜索失败：请求失败：TimeoutError")
     assert "no matches" not in result
+
+
+def test_search_both_keeps_memories_when_threads_fail() -> None:
+    client = FakeToolClient(
+        memories=[_memory()],
+        search_threads_error=NmemError("请求失败：TimeoutError"),
+    )
+    result = asyncio.run(_tools(client).search("查询", scope="both"))
+    assert "[memory] id=m1" in result
+    assert "[thread]" not in result
+    assert result.endswith("note: 对话检索失败：请求失败：TimeoutError")
+
+
+def test_search_both_keeps_threads_when_memories_fail() -> None:
+    client = FakeToolClient(
+        threads=[{"thread_id": "t1", "title": "对话", "relevance_score": 0.8}],
+        search_error=NmemError("HTTP 500", status=500),
+    )
+    result = asyncio.run(_tools(client).search("查询", scope="both"))
+    assert "[thread] id=t1" in result
+    assert "[memory]" not in result
+    assert result.endswith("note: 记忆检索失败：HTTP 500")
+
+
+def test_search_both_returns_error_only_when_both_fail() -> None:
+    client = FakeToolClient(
+        search_error=NmemError("HTTP 500", status=500),
+        search_threads_error=NmemError("HTTP 502", status=502),
+    )
+    result = asyncio.run(_tools(client).search("查询", scope="both"))
+    assert result.startswith("error: Nowledge Mem 搜索失败：")
+    assert "记忆检索失败：HTTP 500" in result
+    assert "对话检索失败：HTTP 502" in result
 
 
 def test_save_success_passes_identity_and_labels() -> None:
@@ -566,6 +649,24 @@ def test_update_notes_labels_cannot_be_verified() -> None:
     assert "warn" not in result
 
 
+def test_update_empty_labels_explains_not_supported() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(_tools(client).update("m1", labels=[]))
+    assert result == (
+        "error: labels 为空列表；服务端当前不支持清空标签，请至少提供其它字段"
+    )
+    assert client.update_calls == []
+
+
+def test_update_notes_truncated_labels() -> None:
+    client = FakeToolClient()
+    result = asyncio.run(
+        _tools(client).update("m1", labels=["x" * (MAX_LABEL_CHARS + 1)])
+    )
+    assert client.update_calls[0]["labels"] == ["x" * MAX_LABEL_CHARS]
+    assert result.count("note: 标签超长已截断") == 1
+
+
 def test_update_warns_when_unit_type_not_applied() -> None:
     client = FakeToolClient(update_result={"id": "m1", "unit_type": "fact"})
     result = asyncio.run(_tools(client).update("m1", unit_type="decision"))
@@ -630,7 +731,7 @@ def test_status_reports_versions_attention_pending_and_last_sync() -> None:
     assert "attention_has_pending_reviews: true (非精确计数)" in result
     assert "pending: 1 (本会话)" in result
     assert "last_sync: 2026-11-07T10:00:00+00:00" in result
-    assert "plugin_version: 0.18.1" in result
+    assert "plugin_version: 0.18.2" in result
     assert client.attention_calls == 0
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -98,6 +99,25 @@ def test_search_parses_get_shape() -> None:
             "source_thread": "t3",
         }
     ]
+
+
+def test_search_without_score_omits_score_key() -> None:
+    payload = [{"id": "m3", "title": "无分数", "content": "正文"}]
+    session = FakeSession([FakeResponse(200, payload)])
+    client = _client(session)
+    result = asyncio.run(client.search("hello", limit=5, space_id="space"))
+    assert result == [
+        {
+            "id": "m3",
+            "title": "无分数",
+            "content": "正文",
+            "unit_type": "memory",
+            "importance": 0.0,
+            "labels": [],
+            "source_thread": "",
+        }
+    ]
+    assert "score" not in result[0]
 
 
 def test_search_empty_get_shape_is_empty_not_error() -> None:
@@ -530,3 +550,87 @@ def test_search_omits_empty_recorded_date_window() -> None:
     body = session.calls[0]["kwargs"]["json"]
     for key in ("recorded_date_from", "recorded_date_to"):
         assert key not in body
+
+
+def test_http_error_includes_response_body_excerpt() -> None:
+    session = FakeSession(
+        [FakeResponse(400, body='{"detail":   "bad labels", "field": "labels"}')]
+    )
+    client = _client(session)
+    with pytest.raises(NmemError) as info:
+        asyncio.run(client.update_memory("m1", labels=["alpha"]))
+    assert info.value.status == 400
+    message = str(info.value)
+    assert message.startswith("HTTP 400: ")
+    # 只展示结构化 detail，不把原始 JSON 整体贴进模型上下文
+    assert "bad labels" in message
+    assert '"field"' not in message
+
+
+def test_http_error_detail_is_redacted_for_secrets_and_paths() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(
+                400,
+                body=json.dumps(
+                    {
+                        "detail": "bad token Bearer nmem_abcdef123456 at /var/lib/nowledge-mem/data",
+                    }
+                ),
+            )
+        ]
+    )
+    client = _client(session)
+    with pytest.raises(NmemError) as info:
+        asyncio.run(client.update_memory("m1", title="x"))
+    message = str(info.value)
+    assert "nmem_abcdef123456" not in message
+    assert "/var/lib/nowledge-mem" not in message
+    assert "<redacted" in message
+
+
+def test_http_error_ignores_non_json_body() -> None:
+    session = FakeSession([FakeResponse(500, body="internal panic at /srv/app/x")])
+    client = _client(session)
+    with pytest.raises(NmemError) as info:
+        asyncio.run(client.update_memory("m1", title="x"))
+    message = str(info.value)
+    assert message == "HTTP 500"
+    assert "/srv/app" not in message
+
+
+def test_http_error_without_readable_body_keeps_plain_message() -> None:
+    class NoTextResponse(FakeResponse):
+        async def text(self) -> str:
+            raise RuntimeError("no body")
+
+    session = FakeSession([NoTextResponse(500, {})])
+    client = _client(session)
+    with pytest.raises(NmemError) as info:
+        asyncio.run(client.search("hello", limit=3, space_id="space"))
+    assert str(info.value) == "HTTP 500"
+
+
+def test_save_memory_uses_extended_write_timeout() -> None:
+    session = FakeSession([FakeResponse(200, {"id": "m1"})])
+    client = _client(session)
+    asyncio.run(
+        client.save_memory(
+            "内容",
+            title="标题",
+            unit_type="fact",
+            importance=0.6,
+            labels=[],
+            space_id="space",
+            agent_id="astrbot",
+            source_app="astrbot",
+        )
+    )
+    assert session.calls[0]["kwargs"]["timeout"].total == 6.0
+
+
+def test_update_memory_uses_extended_write_timeout() -> None:
+    session = FakeSession([FakeResponse(200, {"id": "m1"})])
+    client = _client(session)
+    asyncio.run(client.update_memory("m1", content="新正文"))
+    assert session.calls[0]["kwargs"]["timeout"].total == 6.0

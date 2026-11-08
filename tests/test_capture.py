@@ -38,6 +38,28 @@ class GatedCaptureClient(FakeCaptureClient):
         return self.responses.pop(0)
 
 
+def _reset_pending(umo: str) -> dict:
+    thread_id = thread_id_for(
+        umo, "space", "astrbot", "http://mem.local:14242", TEST_KEY_DIGEST
+    )
+    window = [
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a"},
+    ]
+    return {
+        "mode": "reset",
+        "thread_id": thread_id,
+        "messages": window,
+        "expected_count": None,
+        "idempotency_key": None,
+        "attempts": 0,
+        "last_error": "",
+        "at": "x",
+        "window": window,
+        "title": "t",
+    }
+
+
 def test_first_reset_then_append() -> None:
     store, client = FakeStore(), FakeCaptureClient([success_ack(2), success_ack(4)])
     coordinator = make_coordinator(client, store)
@@ -697,3 +719,49 @@ def test_api_key_isolates_thread_and_cursor() -> None:
 
     asyncio.run(scenario())
     assert store_a.cursor("umo")["thread_id"] != store_b.cursor("umo")["thread_id"]
+
+
+def test_schedule_pending_retry_dedupes_same_umo() -> None:
+    store = FakeStore()
+    client = FakeCaptureClient([success_ack(2)])
+    coordinator = make_coordinator(client, store)
+
+    async def scenario() -> None:
+        await store.set_pending("umo", _reset_pending("umo"))
+        for _ in range(20):
+            coordinator.schedule_pending_retry("umo")
+        assert len(coordinator._tasks) == 1
+        assert list(coordinator._pending_retry_tasks) == ["umo"]
+        await coordinator.wait()
+        assert coordinator._pending_retry_tasks == {}
+
+    asyncio.run(scenario())
+    assert len(client.calls) == 1
+    assert store.pending("umo") is None
+
+
+def test_schedule_pending_retry_respects_concurrency_cap() -> None:
+    store = FakeStore()
+    client = FakeCaptureClient([success_ack(2), success_ack(2)])
+    coordinator = make_coordinator(
+        client, store, max_concurrent_pending_retries=2
+    )
+
+    async def scenario() -> None:
+        for index in range(5):
+            umo = f"umo-{index}"
+            await store.set_pending(umo, _reset_pending(umo))
+        for index in range(5):
+            coordinator.schedule_pending_retry(f"umo-{index}")
+        assert len(coordinator._tasks) == 2
+        assert list(coordinator._pending_retry_tasks) == ["umo-0", "umo-1"]
+        await coordinator.wait()
+        assert coordinator._pending_retry_tasks == {}
+
+    asyncio.run(scenario())
+    assert len(client.calls) == 2
+    assert store.pending("umo-0") is None
+    assert store.pending("umo-1") is None
+    assert store.pending("umo-2") is not None
+    assert store.pending("umo-3") is not None
+    assert store.pending("umo-4") is not None

@@ -2,7 +2,7 @@ name: nowledge_mem_astrbot
 display_name: Nowledge Mem
 desc: 将 Nowledge Mem 的上下文与长期记忆注入 AstrBot 对话，并把每轮增量同步到 Mem thread
 short_desc: Nowledge Mem 上下文注入与对话同步
-version: 0.18.1
+version: 0.18.2
 author: YAYOI
 repo: https://github.com/yayoinoyume/nowledge-mem-astrbot
 astrbot_version: ">=4.27.3"

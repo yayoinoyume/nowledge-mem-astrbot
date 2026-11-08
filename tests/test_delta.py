@@ -87,7 +87,7 @@ def test_legacy_cursor_resets() -> None:
     assert plan.mode == RESET
 
 
-def test_tool_message_keeps_full_result() -> None:
+def test_tool_transcript_message_is_dropped() -> None:
     raw = [
         {
             "role": "assistant",
@@ -98,20 +98,22 @@ def test_tool_message_keeps_full_result() -> None:
         },
         {"role": "tool", "tool_call_id": "c1", "content": "x" * 300},
     ]
-    messages = extract_messages(raw)
-    assert messages == [{"role": "assistant", "content": "[Tool web_search] " + "x" * 300}]
+    assert extract_messages(raw) == []
 
 
-def test_tool_message_truncates_at_20000_chars() -> None:
-    raw = [{"role": "tool", "tool_call_id": "missing", "content": "y" * 20_001}]
-    assert extract_messages(raw) == [
-        {"role": "assistant", "content": "[Tool tool] " + "y" * 20_000}
-    ]
+def test_tool_prefixed_assistant_text_is_dropped() -> None:
+    raw = [{"role": "assistant", "content": "[Tool web_search] 查询结果"}]
+    assert extract_messages(raw) == []
 
 
-def test_tool_message_without_name_uses_tool() -> None:
-    raw = [{"role": "tool", "tool_call_id": "missing", "content": "结果"}]
-    assert extract_messages(raw) == [{"role": "assistant", "content": "[Tool tool] 结果"}]
+def test_tool_word_inside_sentence_is_kept() -> None:
+    raw = [{"role": "assistant", "content": "刚才的 [Tool web_search] 调用失败了"}]
+    assert extract_messages(raw) == raw
+
+
+def test_bracketed_word_starting_with_tool_is_kept() -> None:
+    raw = [{"role": "assistant", "content": "[Toolbox] 这是正常文本"}]
+    assert extract_messages(raw) == raw
 
 
 def test_system_reminder_tail_with_datetime_is_removed() -> None:

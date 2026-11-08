@@ -13,6 +13,7 @@ MAX_TOOL_RESULT_CHARS = 20_000
 SYSTEM_REMINDER_PART_RE = re.compile(
     r"\s*<system_reminder>.*?</system_reminder>\s*$", re.DOTALL
 )
+TOOL_TRANSCRIPT_RE = re.compile(r"^\[Tool(?:\s[^\]]*)?\]")
 HEARTBEAT_SILENT = "<HEARTBEAT_SILENT>"
 
 class DeltaPlan(NamedTuple):
@@ -93,6 +94,10 @@ def _extract_messages(
             content = f"[Tool {name}] {content[:MAX_TOOL_RESULT_CHARS]}".strip()
             role = "assistant"
         if role not in ("user", "assistant") or not content:
+            continue
+        # 工具结果与工具正文不进对话线程；只匹配行首的 "[Tool xxx]"，
+        # 正常正文里提到 Tool 不受影响。
+        if role == "assistant" and TOOL_TRANSCRIPT_RE.match(content):
             continue
         if drop_internal and is_internal_heartbeat_message(
             role, content, heartbeat_markers

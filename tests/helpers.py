@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -37,10 +38,17 @@ def make_cursor(
 
 
 class FakeResponse:
-    def __init__(self, status: int = 200, payload: Any = None, error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        status: int = 200,
+        payload: Any = None,
+        error: BaseException | None = None,
+        body: str | None = None,
+    ) -> None:
         self.status = status
         self._payload = payload
         self._error = error
+        self._body = body
 
     async def __aenter__(self) -> "FakeResponse":
         return self
@@ -52,6 +60,15 @@ class FakeResponse:
         if self._error is not None:
             raise self._error
         return self._payload
+
+    async def text(self) -> str:
+        if self._error is not None:
+            raise self._error
+        if self._body is not None:
+            return self._body
+        if self._payload is None:
+            return ""
+        return json.dumps(self._payload, ensure_ascii=False)
 
 
 class FakeSession:
@@ -149,6 +166,7 @@ def make_coordinator(
     max_attempts: int = 50,
     max_pending_age: float = 24 * 60 * 60,
     max_locks: int = 256,
+    max_concurrent_pending_retries: int = 8,
 ) -> CaptureCoordinator:
     return CaptureCoordinator(
         client,
@@ -162,6 +180,7 @@ def make_coordinator(
         max_attempts=max_attempts,
         max_pending_age=max_pending_age,
         max_locks=max_locks,
+        max_concurrent_pending_retries=max_concurrent_pending_retries,
     )
 
 
