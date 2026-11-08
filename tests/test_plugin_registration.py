@@ -154,7 +154,7 @@ def _plugin(*, save_admin_only: bool = False):
             agent_id="astrbot",
             source_app="astrbot",
             identity="identity123",
-            plugin_version="0.18.2",
+            plugin_version="0.18.3",
             save_admin_only=save_admin_only,
             timeout_seconds=3,
         )

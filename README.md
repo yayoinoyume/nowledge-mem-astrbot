@@ -3,7 +3,7 @@
 把 [Nowledge Mem](https://mem.nowledge.co) 的上下文与长期记忆接入 AstrBot：每轮对话前注入 Context Bundle 与相关记忆召回，每轮结束后把新增消息增量写回同一个 Mem thread。
 
 - 插件名：`nowledge_mem_astrbot`
-- 版本：0.18.2
+- 版本：0.18.3
 - 要求：AstrBot >= 4.27.3
 
 ## 能力
@@ -194,6 +194,8 @@ uv run --with pytest --with aiohttp python -m pytest tests -q
 ```bash
 ASTRBOT_SOURCE=/path/to/astrbot uv run --with pytest --with aiohttp --with pydantic python -m pytest tests -q
 ```
+
+这一档注册模块会整模块 skip，实测 272 passed / 1 skipped；要跑满 327 passed，再补 `--python /path/to/astrbot/.venv/bin/python`。
 
 插件级注册/权限测试需要 AstrBot 的完整依赖，必须用 AstrBot 自己的 venv 解释器跑，否则整模块 skip：
 

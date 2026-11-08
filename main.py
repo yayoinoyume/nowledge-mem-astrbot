@@ -25,7 +25,7 @@ from .core.store import NmemStore
 from .core.tools import NmemTools, VALID_UNIT_TYPES
 
 _DEFAULT_API_URL = "http://127.0.0.1:14242"
-_PLUGIN_VERSION = "0.18.2"
+_PLUGIN_VERSION = "0.18.3"
 MEM_SUM_ROUNDS_DEFAULT = 10
 MAX_DISTILL_ITEMS = 8
 MAX_SUMMARY_MESSAGE_CHARS = 1000

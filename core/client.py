@@ -36,7 +36,7 @@ def _redact(text: str) -> str:
     cleaned = re.sub(r"(?i)bearer\s+[A-Za-z0-9._\-]+", "Bearer <redacted>", text)
     cleaned = re.sub(r"\bnmem_[A-Za-z0-9._\-]{8,}", "<redacted-key>", cleaned)
     cleaned = re.sub(r"\bsk-[A-Za-z0-9._\-]{8,}", "<redacted-key>", cleaned)
-    cleaned = re.sub(r"(/[A-Za-z0-9._\-]+){3,}", "<redacted-path>", cleaned)
+    cleaned = re.sub(r"(/[A-Za-z0-9._\-]+){2,}", "<redacted-path>", cleaned)
     return " ".join(cleaned.split())[:_ERROR_DETAIL_CHARS]
 
 
