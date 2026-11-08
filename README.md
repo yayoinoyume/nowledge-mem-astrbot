@@ -21,15 +21,20 @@
 
 两种方式都落到同一个目录 `<AstrBot 根目录>/data/plugins/nowledge_mem_astrbot`，选一种即可，不要同时维护两份。这里指包含 `data/` 的那层根目录，不是 `data/` 本身。
 
+AstrBot 的插件目录名取自 `metadata.yaml` 的 `name` 字段，本插件写的是 `nowledge_mem_astrbot`（下划线），与仓库名 `nowledge-mem-astrbot`（连字符）并不相同。
+
 **方式一：复制目录**
 
 ```bash
+git clone https://github.com/yayoinoyume/nowledge-mem-astrbot nowledge_mem_astrbot
 cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 ```
 
+`git clone` 的第二个参数把本地目录名指定成下划线形式，后面的 `cp -r` 才对得上；省掉这一步直接 `cp -r nowledge_mem_astrbot` 会报 `No such file or directory`。
+
 **方式二：WebUI 在线安装**
 
-在 AstrBot WebUI 的插件管理里用仓库地址 `https://github.com/yayoinoyume/nowledge-mem-astrbot` 在线安装/更新。AstrBot 会把仓库名转成合法模块名（`-` → `_`），安装目录同样是 `nowledge_mem_astrbot`。
+在 AstrBot WebUI 的插件管理里用仓库地址 `https://github.com/yayoinoyume/nowledge-mem-astrbot` 在线安装/更新；安装目录同样由 `metadata.yaml` 的 `name` 字段决定，因此也是 `nowledge_mem_astrbot`（下划线）。
 
 装好后重启 AstrBot，在 WebUI 的插件配置里填写 `api_url` 与 `api_key`。依赖只有 `aiohttp`（AstrBot 已自带，`requirements.txt` 仅作声明）。
 
@@ -93,7 +98,7 @@ cp -r nowledge_mem_astrbot <AstrBot 根目录>/data/plugins/
 | nowledge_mem_graph | query 或 memory_id（二选一）、depth（1–5，默认 1） | 探索知识图谱，返回相邻实体、关系和方向；未知节点返回「无邻居或节点不存在」 |
 | nowledge_mem_skill | name | 读取内置技能正文；只允许 7 个固定名字，拒绝路径穿越 |
 
-保存时把 source_umo 与 sender_hash（sha1 前 16 位，非匿名化）写入 metadata；服务端顶层不接受这三个字段，实测会被静默忽略。
+保存时把 `import_origin`（取 `source_app` 的值）、`source_umo` 与 `sender_hash`（sha1 前 16 位，非匿名化）三项写入 metadata；服务端顶层请求体不接受这三项，写在顶层会被静默忽略。
 
 所有工具只返回字符串：成功是正文，失败以 `error:` 开头，不向对话抛异常。查询类工具 member 可用；`nowledge_mem_save` 与 `nowledge_mem_update` 仍受 `save_admin_only` 控制。
 
@@ -196,3 +201,7 @@ ASTRBOT_SOURCE=/path/to/astrbot/app uv run --python /path/to/astrbot/app/.venv/b
 ```bash
 NMEM_API_URL=... NMEM_API_KEY=... python scripts/smoke_readonly.py
 ```
+
+## 许可证
+
+MIT，全文见 [LICENSE](LICENSE)。
